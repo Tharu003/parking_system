@@ -1,1098 +1,1073 @@
 <?php
 session_start();
-include 'config/db.php';
+require_once 'config/db.php';
+require_once 'config/auth.php';
+require_security_login();
 
-// Session Security Check
-if (!isset($_SESSION['admin_logged_in']) || $_SESSION['admin_logged_in'] !== true) {
-    header("Location: admin_login.php");
-    exit();
+$checkout_success=false;
+$error_msg='';
+$success_msg='';
+$calculated_data=null;
+$printed_ticket=null;
+$printed_vip=null;
+
+define('GRACE_PERIOD_MINUTES',15);
+define('ADDITIONAL_HOUR_RATE',15.00);
+
+function calculate_checkout(mysqli $conn,int $ticket_id,bool $lost): ?array {
+    $stmt=$conn->prepare(
+        "SELECT t.*,vt.type_name,vt.hourly_rate
+         FROM tickets t
+         JOIN vehicle_types vt ON t.vehicle_type_id=vt.id
+         WHERE t.id=? AND t.status='PARKED' LIMIT 1"
+    );
+    $stmt->bind_param("i",$ticket_id);
+    $stmt->execute();
+    $t=$stmt->get_result()->fetch_assoc();
+    $stmt->close();
+
+    if(!$t) return null;
+
+    $entry=new DateTime($t['entry_time']);
+    $now=new DateTime();
+    $diff=$entry->diff($now);
+    $minutes=($diff->days*1440)+($diff->h*60)+$diff->i;
+    $hours=max(1,(int)ceil($minutes/60));
+    $grace=$minutes<=GRACE_PERIOD_MINUTES&&!$lost;
+    $extra_hours=max(0,$hours-1);
+    $fee=$grace?0.0:(float)$t['hourly_rate']+($extra_hours*ADDITIONAL_HOUR_RATE);
+
+    if((int)$t['is_vip']===1&&!$lost) $fee=0.0;
+
+    return [
+        'record_type'=>'TICKET',
+        'ticket_id'=>(int)$t['id'],
+        'ticket_code'=>$t['ticket_code'],
+        'vehicle_number'=>$t['vehicle_number'],
+        'category'=>$t['type_name'],
+        'hourly_rate'=>(float)$t['hourly_rate'],
+        'entry_time'=>$t['entry_time'],
+        'exit_time'=>$now->format('Y-m-d H:i:s'),
+        'total_minutes'=>$minutes,
+        'duration_hours'=>$hours,
+        'calculated_fee'=>$fee,
+        'is_grace'=>$grace,
+        'is_lost'=>$lost,
+        'is_vip'=>(int)$t['is_vip']
+    ];
 }
 
-// Extract Username & Format
-$raw_username = $_SESSION['admin_username'] ?? ($_SESSION['admin_name'] ?? 'Admin');
-$display_name = ucfirst(strtolower($raw_username)) . " Admin";
+function calculate_vip_checkout(mysqli $conn,int $session_id): ?array {
+    $stmt=$conn->prepare(
+        "SELECT * FROM vip_parking_sessions
+         WHERE id=? AND status='PARKED' LIMIT 1"
+    );
+    $stmt->bind_param("i",$session_id);
+    $stmt->execute();
+    $v=$stmt->get_result()->fetch_assoc();
+    $stmt->close();
 
-// Logout Handler
-if (isset($_GET['action']) && $_GET['action'] === 'logout') {
-    session_destroy();
-    header("Location: admin_login.php");
-    exit();
+    if(!$v) return null;
+
+    $entry=new DateTime($v['entry_time']);
+    $now=new DateTime();
+    $diff=$entry->diff($now);
+    $minutes=($diff->days*1440)+($diff->h*60)+$diff->i;
+    $hours=max(1,(int)ceil($minutes/60));
+
+    return [
+        'record_type'=>'VIP',
+        'session_id'=>(int)$v['id'],
+        'ticket_code'=>'',
+        'vehicle_number'=>$v['vehicle_number'],
+        'category'=>'VIP Vehicle',
+        'hourly_rate'=>0.0,
+        'entry_time'=>$v['entry_time'],
+        'exit_time'=>$now->format('Y-m-d H:i:s'),
+        'total_minutes'=>$minutes,
+        'duration_hours'=>$hours,
+        'calculated_fee'=>0.0,
+        'is_grace'=>false,
+        'is_lost'=>false,
+        'is_vip'=>1,
+        'slot_label'=>$v['slot_label'],
+        'driver_name'=>$v['driver_name'],
+        'reason'=>$v['reason']
+    ];
 }
 
-// --- HANDLE VOID / CANCEL ACTION DIRECTLY FROM DASHBOARD ---
-$action_msg = "";
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['process_void_action'])) {
-    $ticket_id    = intval($_POST['ticket_id']);
-    $action_type  = $_POST['action_type']; // 'APPROVE' or 'REJECT'
-    $admin_notes  = $conn->real_escape_string(trim($_POST['admin_notes']));
-    $reviewed_by  = $conn->real_escape_string($raw_username);
+/* ---------------------------------------------------------------
+   SEARCH AT EXIT GATE
+   - Ticket QR/code/plate -> normal ticket flow
+   - VIP has NO ticket/QR -> plate lookup finds the active VIP session
+   --------------------------------------------------------------- */
+if(isset($_POST['search_ticket'])||isset($_POST['qr_ticket_code'])){
+    $q=strtoupper(trim($_POST['search_query']??$_POST['qr_ticket_code']??''));
+    $lost=!empty($_POST['is_lost_mode']);
 
-    // Fetch Ticket Status
-    $t_check = $conn->query("SELECT status FROM tickets WHERE id = $ticket_id")->fetch_assoc();
-    
-    if ($t_check) {
-        $current_status = $t_check['status'];
-        $new_status = '';
+    if($q!=='') {
 
-        if ($action_type === 'APPROVE') {
-            $new_status = ($current_status === 'VOID_REQUESTED') ? 'VOIDED' : 'CANCELLED';
+        /* VIP plate is checked first when the input is a vehicle number. */
+        $vip_stmt=$conn->prepare(
+            "SELECT id FROM vip_parking_sessions
+             WHERE vehicle_number=? AND status='PARKED' LIMIT 1"
+        );
+        $vip_stmt->bind_param("s",$q);
+        $vip_stmt->execute();
+        $vip_row=$vip_stmt->get_result()->fetch_assoc();
+        $vip_stmt->close();
+
+        if($vip_row) {
+            $calculated_data=calculate_vip_checkout($conn,(int)$vip_row['id']);
         } else {
-            $new_status = 'REJECTED';
+            $stmt=$conn->prepare(
+                "SELECT id FROM tickets
+                 WHERE (ticket_code=? OR vehicle_number=?) AND status='PARKED'
+                 LIMIT 1"
+            );
+            $stmt->bind_param("ss",$q,$q);
+            $stmt->execute();
+            $row=$stmt->get_result()->fetch_assoc();
+            $stmt->close();
+
+            if($row) {
+                $calculated_data=calculate_checkout($conn,(int)$row['id'],$lost);
+            } else {
+                $error_msg='No active parking record was found for the ticket code or vehicle number.';
+            }
+        }
+    } else {
+        $error_msg='Please enter a ticket code or vehicle number.';
+    }
+}
+
+/* ---------------------------------------------------------------
+   COMPLETE EXIT
+   --------------------------------------------------------------- */
+if(isset($_POST['process_checkout'])){
+    $record_type=$_POST['record_type']??'TICKET';
+
+    if($record_type==='VIP') {
+
+        $session_id=(int)($_POST['session_id']??0);
+        $calc=calculate_vip_checkout($conn,$session_id);
+
+        if(!$calc) {
+            $error_msg='This VIP vehicle is no longer active or has already exited.';
+        } else {
+            $exit=$calc['exit_time'];
+            $minutes=$calc['total_minutes'];
+            $guard_name=security_user_name();
+
+            $up=$conn->prepare(
+                "UPDATE vip_parking_sessions
+                 SET exit_time=?,duration_minutes=?,status='COMPLETED',exited_by=?
+                 WHERE id=? AND status='PARKED'"
+            );
+            $up->bind_param("sisi",$exit,$minutes,$guard_name,$session_id);
+
+            if($up->execute()&&$up->affected_rows===1) {
+                $checkout_success=true;
+                $success_msg='VIP vehicle exit completed. No parking fee is payable.';
+                security_audit(
+                    $conn,
+                    'VIP vehicle '.$calc['vehicle_number'].' exited. NO FEE. VIP Session ID: '.$session_id
+                );
+
+                $pr=$conn->prepare("SELECT * FROM vip_parking_sessions WHERE id=?");
+                $pr->bind_param("i",$session_id);
+                $pr->execute();
+                $printed_vip=$pr->get_result()->fetch_assoc();
+                $pr->close();
+            } else {
+                $error_msg='VIP checkout could not be completed. The record may have already been processed.';
+            }
+            $up->close();
         }
 
-        $update_q = "UPDATE tickets SET 
-                        status = '$new_status', 
-                        reviewed_by = '$reviewed_by', 
-                        reviewed_at = NOW(), 
-                        admin_notes = '$admin_notes' 
-                    WHERE id = $ticket_id";
+    } else {
 
-        if ($conn->query($update_q)) {
-            $action_msg = "<div class='alert-toast success-toast'>
-                            <i class='fa-solid fa-circle-check'></i> Ticket request successfully processed as <strong>" . $new_status . "</strong>!
-                          </div>";
+        $ticket_id=(int)($_POST['ticket_id']??0);
+        $lost=!empty($_POST['is_lost_mode']);
+        $calc=calculate_checkout($conn,$ticket_id,$lost);
+
+        if(!$calc) {
+            $error_msg='This ticket is no longer active or has already been completed.';
+        } else {
+            $exit=$calc['exit_time'];
+            $hours=$calc['duration_hours'];
+            $fee=$calc['calculated_fee'];
+
+            $up=$conn->prepare(
+                "UPDATE tickets
+                 SET exit_time=?,duration_hours=?,total_fee=?,status='COMPLETED'
+                 WHERE id=? AND status='PARKED'"
+            );
+            $up->bind_param("sidi",$exit,$hours,$fee,$ticket_id);
+
+            if($up->execute()&&$up->affected_rows===1){
+                $checkout_success=true;
+                $success_msg='Vehicle exit completed. Amount collected: LKR '.number_format($fee,2);
+
+                security_audit(
+                    $conn,
+                    'Vehicle '.$calc['vehicle_number'].' exited. Ticket '.$calc['ticket_code']
+                    .' | Fee LKR '.number_format($fee,2)
+                );
+
+                $pr=$conn->prepare(
+                    "SELECT t.*,vt.type_name
+                     FROM tickets t
+                     JOIN vehicle_types vt ON t.vehicle_type_id=vt.id
+                     WHERE t.id=?"
+                );
+                $pr->bind_param("i",$ticket_id);
+                $pr->execute();
+                $printed_ticket=$pr->get_result()->fetch_assoc();
+                $pr->close();
+            } else {
+                $error_msg='Checkout could not be completed. Please try again.';
+            }
+            $up->close();
         }
     }
 }
 
-// Dynamic Database Analytics
-$ticket_parked   = $conn->query("SELECT COUNT(*) AS total FROM tickets WHERE status = 'PARKED'")->fetch_assoc()['total'] ?? 0;
-$vip_parked      = $conn->query("SELECT COUNT(*) AS total FROM vip_parking_sessions WHERE status = 'PARKED'")->fetch_assoc()['total'] ?? 0;
-$total_parked    = (int)$ticket_parked + (int)$vip_parked;
-$ticket_completed= $conn->query("SELECT COUNT(*) AS total FROM tickets WHERE status = 'COMPLETED'")->fetch_assoc()['total'] ?? 0;
-$vip_completed   = $conn->query("SELECT COUNT(*) AS total FROM vip_parking_sessions WHERE status = 'COMPLETED'")->fetch_assoc()['total'] ?? 0;
-$total_completed = (int)$ticket_completed + (int)$vip_completed;
-$pending_vip     = $conn->query("SELECT COUNT(*) AS total FROM vip_requests WHERE status = 'PENDING'")->fetch_assoc()['total'] ?? 0;
-$total_revenue   = $conn->query("SELECT SUM(total_fee) AS total FROM tickets WHERE status = 'COMPLETED'")->fetch_assoc()['total'] ?? 0.00;
-
-// Fetch Pending Void / Cancellation Requests
-$pending_void_query = "SELECT t.*, v.type_name 
-                       FROM tickets t 
-                       LEFT JOIN vehicle_types v ON t.vehicle_type_id = v.id 
-                       WHERE t.status IN ('VOID_REQUESTED', 'CANCEL_REQUESTED') 
-                       ORDER BY t.requested_at DESC";
-$pending_void_res   = $conn->query($pending_void_query);
-$pending_void_count = $pending_void_res ? $pending_void_res->num_rows : 0;
-
-// Fetch All Live Tickets for Client-Side DataTable
-$tickets_query = "SELECT t.*, v.type_name 
-                  FROM tickets t 
-                  LEFT JOIN vehicle_types v ON t.vehicle_type_id = v.id 
-                  ORDER BY t.id DESC";
-$tickets_result = $conn->query($tickets_query);
-$tickets_total  = $tickets_result ? $tickets_result->num_rows : 0;
-
-// UI helpers
-function vehicle_icon($name) {
-    $n = strtolower($name ?? '');
-    if (preg_match('/bike|motor|cycle/', $n)) return 'fa-motorcycle';
-    if (strpos($n, 'bus') !== false)          return 'fa-bus';
-    if (preg_match('/lorry|truck/', $n))      return 'fa-truck';
-    if (strpos($n, 'van') !== false)          return 'fa-van-shuttle';
-    if (preg_match('/three|tuk|wheel/', $n))  return 'fa-taxi';
-    return 'fa-car-side';
-}
-function status_badge($status) {
-    $map = [
-        'PARKED'           => ['st-parked',  'Parked'],
-        'COMPLETED'        => ['st-done',    'Completed'],
-        'VOID_REQUESTED'   => ['st-warn',    'Void Requested'],
-        'CANCEL_REQUESTED' => ['st-warn',    'Cancel Requested'],
-        'VOIDED'           => ['st-danger',  'Voided'],
-        'CANCELLED'        => ['st-danger',  'Cancelled'],
-        'REJECTED'         => ['st-muted',   'Rejected'],
-    ];
-    $m = $map[$status] ?? ['st-muted', ucfirst(strtolower(str_replace('_', ' ', $status))) ];
-    return "<span class='status-pill {$m[0]}'><i class='dot'></i>{$m[1]}</span>";
-}
+include 'includes/header.php';
 ?>
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Ambalangoda MPCS - Parking Management System</title>
+
+<!-- Html5 QR Code Scanner Library -->
+<script src="https://unpkg.com/html5-qrcode"></script>
+
+<style>
+    :root {
+        --app-bg: #F1EEFB;
+        --card-bg: #FFFFFF;
+        --text-color: #17123A;
+        --sub-text: #6b6489;
+        --accent-orange: #FF6B00;
+        --orange-gradient: linear-gradient(135deg, #FF7A1A, #FFB800);
+        --accent-blue: #4C3AF5;
+        --dark-navy: #120B2E;
+        --accent-red: #F0455F;
+        --accent-green: #17C785;
+        --border-color: #E6E1F7;
+    }
+
+    @keyframes bgDrift {
+        0%   { background-position: 0% 50%; }
+        50%  { background-position: 100% 50%; }
+        100% { background-position: 0% 50%; }
+    }
+    @keyframes fadeSlideUp {
+        from { opacity: 0; transform: translateY(14px); }
+        to   { opacity: 1; transform: translateY(0); }
+    }
+    @keyframes popIn {
+        0%   { opacity: 0; transform: scale(0.7); }
+        70%  { opacity: 1; transform: scale(1.06); }
+        100% { opacity: 1; transform: scale(1); }
+    }
+    @keyframes softPulse {
+        0%, 100% { box-shadow: 0 0 0 0 rgba(23,199,133,0.45); }
+        50%      { box-shadow: 0 0 0 8px rgba(23,199,133,0); }
+    }
+    @keyframes shimmer {
+        0%   { background-position: -200px 0; }
+        100% { background-position: calc(200px + 100%) 0; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+        *, *::before, *::after { animation-duration: 0.001ms !important; animation-iteration-count: 1 !important; }
+    }
+
+    body {
+        background-color: var(--app-bg);
+        background-image:
+            radial-gradient(circle at 15% 10%, rgba(76,58,245,0.10), transparent 40%),
+            radial-gradient(circle at 85% 0%, rgba(255,122,26,0.10), transparent 38%);
+    }
+
+    /* Terminal Header Bar */
+    .terminal-header {
+        background: linear-gradient(135deg, var(--dark-navy), var(--accent-blue) 60%, #6B4CF6);
+        background-size: 180% 180%;
+        animation: fadeSlideUp 0.5s ease both, bgDrift 12s ease-in-out infinite;
+        color: #FFFFFF;
+        padding: 24px 30px;
+        border-radius: 20px;
+        box-shadow: 0 10px 30px rgba(23, 18, 58, 0.2);
+        margin-bottom: 30px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 15px;
+    }
+    .terminal-info { display: flex; align-items: center; gap: 16px; }
+    .exit-avatar {
+        width: 55px; height: 55px;
+        background: var(--orange-gradient);
+        color: white; border-radius: 16px;
+        display: flex; align-items: center; justify-content: center;
+        font-size: 24px; box-shadow: 0 4px 15px rgba(255, 122, 26, 0.45);
+        animation: popIn 0.5s ease 0.1s both;
+    }
+    .live-clock-badge {
+        background: rgba(255, 255, 255, 0.14);
+        padding: 8px 18px; border-radius: 30px;
+        font-size: 13px; font-weight: 600;
+        border: 1px solid rgba(255,255,255,0.22);
+        display: flex; align-items: center; gap: 8px;
+        animation: fadeSlideUp 0.5s ease 0.15s both;
+    }
+    .live-clock-badge::before {
+        content: ''; width: 7px; height: 7px; border-radius: 50%;
+        background: var(--accent-green); display: inline-block;
+        animation: softPulse 1.8s ease-in-out infinite;
+    }
+
+    /* Slot Progress Cards */
+    .slots-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+        gap: 20px; margin-bottom: 30px;
+    }
+    .slot-card {
+        background: var(--card-bg); border-radius: 20px; padding: 22px;
+        border: 1px solid var(--border-color);
+        box-shadow: 0 6px 20px rgba(76,58,245,0.06);
+        transition: transform 0.25s ease, box-shadow 0.25s ease;
+        animation: fadeSlideUp 0.5s ease both;
+    }
+    .slot-card:nth-child(1) { animation-delay: 0.05s; }
+    .slot-card:nth-child(2) { animation-delay: 0.12s; }
+    .slot-card:nth-child(3) { animation-delay: 0.19s; }
+    .slot-card:nth-child(4) { animation-delay: 0.26s; }
+    .slot-card:nth-child(5) { animation-delay: 0.33s; }
+    .slot-card:hover { transform: translateY(-3px); box-shadow: 0 10px 26px rgba(76,58,245,0.12); }
+    .slot-card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+    .slot-card-title { font-weight: 700; color: var(--text-color); font-size: 15px; display: flex; align-items: center; gap: 10px; }
+    .slot-card-title i { color: var(--accent-orange); font-size: 18px; }
+    .slot-progress-bg { background: var(--border-color); height: 8px; border-radius: 10px; overflow: hidden; margin-top: 10px; }
+    .slot-progress-fill { height: 100%; border-radius: 10px; transition: 0.5s ease-in-out; }
+
+    /* Main Terminal Layout (Grid Structure) */
+    .terminal-main-layout {
+        display: grid;
+        grid-template-columns: 1.6fr 1fr;
+        gap: 30px;
+        margin-bottom: 30px;
+    }
+    @media (max-width: 992px) {
+        .terminal-main-layout { grid-template-columns: 1fr; }
+    }
+
+    /* Exit Card */
+    .exit-card {
+        background: var(--card-bg); border-radius: 24px; padding: 32px;
+        box-shadow: 0 10px 30px rgba(23,18,58,0.06); border: 1px solid var(--border-color);
+        position: relative; overflow: hidden;
+        animation: fadeSlideUp 0.5s ease both;
+    }
+    .exit-card::before {
+        content: ''; position: absolute; top: 0; left: 0; width: 100%; height: 6px;
+        background: linear-gradient(90deg, var(--accent-green), var(--accent-orange), var(--accent-blue), var(--accent-green));
+        background-size: 300% 100%;
+        animation: bgDrift 6s linear infinite;
+    }
+
+    .search-mode-selector { display: flex; gap: 10px; margin-bottom: 20px; }
+    .mode-btn {
+        flex: 1; padding: 12px; border-radius: 12px; border: 1px solid var(--border-color);
+        background: #F8FAFC; color: var(--sub-text); font-weight: 700; cursor: pointer; text-align: center;
+        transition: 0.3s; font-size: 14px;
+    }
+    .mode-btn.active { background: var(--accent-blue); color: white; border-color: var(--accent-blue); }
+    .mode-btn.lost-active { background: var(--accent-red); color: white; border-color: var(--accent-red); }
+
+    .search-input-wrapper { position: relative; margin-bottom: 20px; }
+    .search-input {
+        width: 100%; padding: 16px 140px 16px 50px; border: 2px solid var(--border-color);
+        border-radius: 16px; font-size: 18px; font-weight: 700; background: #F8FAFC;
+        text-transform: uppercase; transition: 0.3s; color: var(--text-color);
+    }
+    .search-input:focus { border-color: var(--accent-orange); background: #FFFFFF; outline: none; box-shadow: 0 0 0 4px rgba(255, 107, 0, 0.15); }
+
+    .btn-qr-scan {
+        position: absolute; right: 8px; top: 50%; transform: translateY(-50%);
+        background: var(--accent-blue); color: #fff; border: none; padding: 10px 16px;
+        border-radius: 12px; font-weight: 600; cursor: pointer; font-size: 13px; transition: 0.3s;
+    }
+    .btn-qr-scan:hover { background: var(--dark-navy); }
+
+    .receipt-box {
+        background: #F8FAFC; border: 2px dashed var(--border-color); border-radius: 20px;
+        padding: 22px; margin-top: 20px;
+    }
+    .receipt-row { display: flex; justify-content: space-between; margin-bottom: 10px; font-size: 14px; font-weight: 600; }
     
-    <!-- FontAwesome & Google Fonts -->
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-
-    <!-- jQuery + DataTables -->
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/jquery/3.7.1/jquery.min.js"></script>
-    <link rel="stylesheet" href="https://cdn.datatables.net/1.13.11/css/jquery.dataTables.min.css">
-    <script src="https://cdn.datatables.net/1.13.11/js/jquery.dataTables.min.js"></script>
-    <link rel="stylesheet" href="https://cdn.datatables.net/responsive/2.5.0/css/responsive.dataTables.min.css">
-    <script src="https://cdn.datatables.net/responsive/2.5.0/js/dataTables.responsive.min.js"></script>
-
-    <style>
-        :root {
-            --primary-orange: #FF6B00;
-            --orange-hover: #E05D00;
-            --navy-blue: #0A192F;
-            --navy-blue-soft: #13223D;
-            --soft-blue-bg: #EFF6FF;
-            --bg-light: #F8FAFC;
-            --white: #FFFFFF;
-            --text-dark: #1E293B;
-            --text-muted: #64748B;
-            --border-color: #E2E8F0;
-        }
-
-        * {
-            box-sizing: border-box;
-            margin: 0;
-            padding: 0;
-            font-family: 'Plus Jakarta Sans', sans-serif;
-        }
-
-        body {
-            background-color: var(--bg-light);
-            color: var(--text-dark);
-            min-height: 100vh;
-        }
-
-        .admin-dashboard-layout {
-            display: flex;
-            min-height: 100vh;
-            width: 100%;
-        }
-
-        /* Sidebar Styles */
-        .dashboard-sidebar {
-            width: 270px;
-            flex-shrink: 0;
-            background: var(--navy-blue);
-            display: flex;
-            flex-direction: column;
-            justify-content: space-between;
-            padding: 24px 16px;
-            position: sticky;
-            top: 0;
-            height: 100vh;
-            box-shadow: 6px 0 25px rgba(10, 25, 47, 0.15);
-            z-index: 999;
-            overflow-y: auto;
-        }
-
-        .sidebar-brand-box {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-            padding: 10px 12px 24px;
-            border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-            margin-bottom: 18px;
-            text-decoration: none;
-        }
-
-        .sidebar-brand-icon {
-            width: 42px;
-            height: 42px;
-            background: linear-gradient(135deg, var(--primary-orange), #FF9E00);
-            color: var(--white);
-            border-radius: 12px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 20px;
-        }
-
-        .sidebar-brand-text h2 {
-            font-size: 19px;
-            font-weight: 800;
-            color: var(--white);
-            line-height: 1.1;
-        }
-
-        .sidebar-brand-text h2 span { color: var(--primary-orange); }
-        .sidebar-brand-text p { font-size: 10px; color: #94A3B8; letter-spacing: 0.5px; font-weight: 700; text-transform: uppercase; }
-
-        .menu-category-label {
-            font-size: 11px;
-            font-weight: 800;
-            color: #64748B;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-            margin: 14px 12px 8px;
-        }
-
-        .sidebar-menu-list {
-            list-style: none;
-            display: flex;
-            flex-direction: column;
-            gap: 4px;
-        }
-
-        .sidebar-menu-link {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-            padding: 11px 16px;
-            color: #94A3B8;
-            text-decoration: none;
-            border-radius: 12px;
-            font-size: 13.5px;
-            font-weight: 600;
-            transition: all 0.25s ease;
-        }
-
-        .sidebar-menu-link:hover {
-            background-color: rgba(255, 255, 255, 0.06);
-            color: var(--white);
-        }
-
-        .sidebar-menu-link.active {
-            background: linear-gradient(135deg, var(--primary-orange), #FF8800);
-            color: var(--white);
-            font-weight: 700;
-        }
-
-        .sidebar-bottom-wrapper {
-            border-top: 1px solid rgba(255, 255, 255, 0.08);
-            padding-top: 18px;
-            display: flex;
-            flex-direction: column;
-            gap: 10px;
-        }
-
-        .sidebar-user-card {
-            background: var(--navy-blue-soft);
-            padding: 12px 14px;
-            border-radius: 14px;
-            color: var(--white);
-            display: flex;
-            align-items: center;
-            gap: 12px;
-        }
-
-        .sidebar-user-avatar {
-            width: 36px;
-            height: 36px;
-            background: var(--primary-orange);
-            color: var(--white);
-            border-radius: 50%;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 14px;
-        }
-
-        .btn-sidebar-logout {
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: 8px;
-            background: rgba(220, 38, 38, 0.12);
-            color: #EF4444;
-            padding: 10px;
-            border-radius: 12px;
-            text-decoration: none;
-            font-weight: 700;
-            font-size: 13px;
-        }
-
-        /* Workspace Layout */
-        .dashboard-workspace {
-            flex: 1;
-            padding: 24px 3%;
-            min-width: 0;
-            display: flex;
-            flex-direction: column;
-            gap: 20px;
-        }
-
-        /* Top Header */
-        .mpcs-top-header {
-            background: var(--white);
-            border-radius: 16px;
-            padding: 18px 24px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            border: 1px solid var(--border-color);
-            border-left: 5px solid var(--primary-orange);
-        }
-
-        .mpcs-brand-info h1 {
-            font-size: 19px;
-            font-weight: 800;
-            color: var(--navy-blue);
-        }
-
-        .mpcs-brand-info p {
-            font-size: 12px;
-            color: var(--text-muted);
-            font-weight: 600;
-        }
-
-        .mpcs-clock-card {
-            background: var(--navy-blue);
-            color: var(--white);
-            padding: 8px 16px;
-            border-radius: 12px;
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }
-
-        .clock-time { font-size: 15px; font-weight: 800; }
-        .clock-date { font-size: 10px; color: #94A3B8; }
-
-        /* NEW NO-CARD SLEEK UNIFIED ANALYTICS BAR */
-        .analytics-strip-container {
-            background: var(--white);
-            border: 1px solid var(--border-color);
-            border-radius: 16px;
-            padding: 16px 20px;
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-            gap: 12px;
-            align-items: center;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.02);
-        }
-
-        .analytics-segment {
-            display: flex;
-            align-items: center;
-            gap: 14px;
-            padding: 8px 12px;
-            border-right: 1px dashed var(--border-color);
-        }
-
-        .analytics-segment:last-child {
-            border-right: none;
-        }
-
-        .segment-icon-pill {
-            width: 40px;
-            height: 40px;
-            border-radius: 10px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 16px;
-            flex-shrink: 0;
-        }
-
-        .segment-details span {
-            display: block;
-            font-size: 11px;
-            font-weight: 700;
-            color: var(--text-muted);
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-        }
-
-        .segment-details h3 {
-            font-size: 20px;
-            font-weight: 800;
-            color: var(--navy-blue);
-            margin-top: 2px;
-            line-height: 1;
-        }
-
-        /* Color accents for icon pills */
-        .pill-blue { background: #EFF6FF; color: #2563EB; }
-        .pill-amber { background: #FEF3C7; color: #D97706; }
-        .pill-emerald { background: #DCFCE7; color: #16A34A; }
-        .pill-orange { background: #FFF1E6; color: var(--primary-orange); }
-        .pill-purple { background: #F3E8FF; color: #9333EA; }
-
-        /* Action Toolbar Row */
-        .toolbar-action-row {
-            display: flex;
-            gap: 12px;
-            flex-wrap: wrap;
-        }
-
-        .btn-toolbar-action {
-            background: var(--white);
-            border: 1px solid var(--border-color);
-            padding: 10px 18px;
-            border-radius: 12px;
-            text-decoration: none;
-            color: var(--navy-blue);
-            font-size: 13px;
-            font-weight: 700;
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            transition: all 0.2s ease;
-        }
-
-        .btn-toolbar-action:hover {
-            border-color: var(--primary-orange);
-            color: var(--primary-orange);
-            background: #FFFDFB;
-        }
-
-        /* DataTables Container */
-        .table-container-card {
-            background: var(--white);
-            border-radius: 16px;
-            padding: 22px;
-            border: 1px solid var(--border-color);
-            box-shadow: 0 2px 10px rgba(0,0,0,0.02);
-        }
-
-        .table-title-bar {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 18px;
-        }
-
-        .table-title-bar h3 {
-            font-size: 16px;
-            font-weight: 800;
-            color: var(--navy-blue);
-        }
-
-        .badge-tag {
-            padding: 5px 10px;
-            border-radius: 20px;
-            font-size: 11px;
-            font-weight: 800;
-        }
-
-        .badge-parked-active { background: #E0F2FE; color: #0284C7; }
-        .badge-completed-out { background: #DCFCE7; color: #16A34A; }
-        .badge-vip-pass { background: #FEF3C7; color: #D97706; }
-
-        /* ---- Mobile-only elements (hidden on desktop) ---- */
-        .mobile-topbar, .sidebar-overlay, .sidebar-close-btn { display: none; }
-
-        /* ================= UI POLISH (same colour palette) ================= */
-        body {
-            background-image: radial-gradient(#E2E8F0 1px, transparent 1px);
-            background-size: 22px 22px;
-        }
-        .sidebar-menu-link:hover { transform: translateX(4px); }
-        .sidebar-menu-link.active { box-shadow: 0 8px 20px rgba(255,107,0,0.35); }
-        .mpcs-top-header { box-shadow: 0 6px 24px rgba(10,25,47,0.05); }
-        .analytics-strip-container { box-shadow: 0 6px 24px rgba(10,25,47,0.05); }
-        .analytics-segment { border-radius: 12px; transition: all .25s ease; }
-        .analytics-segment:hover { background: var(--bg-light); transform: translateY(-3px); }
-        .segment-icon-pill { transition: transform .3s ease; }
-        .analytics-segment:hover .segment-icon-pill { transform: rotate(-8deg) scale(1.1); }
-        .btn-toolbar-action:hover { transform: translateY(-2px); box-shadow: 0 8px 18px rgba(255,107,0,0.12); }
-
-        /* ---------- Table card ---------- */
-        .table-container-card {
-            padding: 0;
-            overflow: hidden;
-            box-shadow: 0 10px 40px rgba(10,25,47,0.07);
-            position: relative;
-        }
-        .table-container-card::before {
-            content: ""; display: block; height: 4px;
-            background: linear-gradient(90deg, var(--primary-orange), #FF9E00, var(--navy-blue));
-        }
-        .table-title-bar {
-            padding: 22px 26px 8px; margin: 0; flex-wrap: wrap; gap: 14px;
-        }
-        .tt-left { display: flex; align-items: center; gap: 14px; }
-        .tt-icon {
-            width: 46px; height: 46px; border-radius: 14px;
-            background: linear-gradient(135deg, var(--primary-orange), #FF9E00);
-            color: var(--white); display: flex; align-items: center; justify-content: center;
-            font-size: 19px; box-shadow: 0 8px 18px rgba(255,107,0,0.3);
-        }
-        .table-title-bar h3 { display: flex; align-items: center; gap: 10px; font-size: 18px; }
-        .table-title-bar p { font-size: 12px; color: var(--text-muted); font-weight: 600; margin-top: 3px; }
-        .live-pill {
-            display: inline-flex; align-items: center; gap: 6px; font-size: 10px; font-weight: 800;
-            letter-spacing: .8px; padding: 4px 9px; border-radius: 20px;
-            background: #DCFCE7; color: #16A34A;
-        }
-        .live-dot { width: 7px; height: 7px; border-radius: 50%; background: #16A34A; animation: pulse 1.6s infinite; }
-        @keyframes pulse {
-            0% { box-shadow: 0 0 0 0 rgba(22,163,74,.6); }
-            70% { box-shadow: 0 0 0 8px rgba(22,163,74,0); }
-            100% { box-shadow: 0 0 0 0 rgba(22,163,74,0); }
-        }
-
-        /* Filter chips */
-        .filter-chips { display: flex; gap: 6px; background: var(--bg-light); padding: 5px; border-radius: 14px; border: 1px solid var(--border-color); }
-        .chip {
-            border: none; background: transparent; cursor: pointer; padding: 8px 16px; border-radius: 10px;
-            font-size: 12.5px; font-weight: 700; color: var(--text-muted); display: flex; align-items: center; gap: 7px;
-            transition: all .25s ease;
-        }
-        .chip:hover { color: var(--navy-blue); background: var(--white); }
-        .chip.active { background: var(--navy-blue); color: var(--white); box-shadow: 0 6px 14px rgba(10,25,47,.25); }
-        .chip.active i { color: var(--primary-orange); }
-
-        .table-responsive { padding: 6px 26px 22px; }
-
-        /* ---------- DataTables overrides ---------- */
-        .dataTables_wrapper .dt-top { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; padding: 14px 0; }
-        .dataTables_wrapper .dataTables_filter { margin: 0; float: none; }
-        .dataTables_wrapper .dataTables_filter label { position: relative; display: block; }
-        .dataTables_wrapper .dataTables_filter label::before {
-            content: "\f002"; font-family: "Font Awesome 6 Free"; font-weight: 900;
-            position: absolute; left: 16px; top: 50%; transform: translateY(-50%);
-            color: var(--primary-orange); font-size: 13px; pointer-events: none;
-        }
-        .dataTables_wrapper .dataTables_filter input {
-            margin: 0; width: 320px; max-width: 100%; padding: 11px 16px 11px 40px;
-            border: 1.5px solid var(--border-color); border-radius: 12px; background: var(--bg-light);
-            font-size: 13px; font-weight: 600; color: var(--text-dark); outline: none; transition: all .25s ease;
-        }
-        .dataTables_wrapper .dataTables_filter input:focus {
-            border-color: var(--primary-orange); background: var(--white); box-shadow: 0 0 0 4px rgba(255,107,0,.12);
-        }
-        .dataTables_wrapper .dataTables_length { float: none; font-size: 12.5px; font-weight: 700; color: var(--text-muted); }
-        .dataTables_wrapper .dataTables_length select {
-            margin: 0 6px; padding: 8px 12px; border: 1.5px solid var(--border-color); border-radius: 10px;
-            background: var(--bg-light); font-weight: 700; color: var(--navy-blue); outline: none; cursor: pointer;
-        }
-
-        table#ticketsTable { border-collapse: separate; border-spacing: 0 8px; border: none; margin: 0 !important; }
-        table#ticketsTable thead th {
-            background: var(--navy-blue); color: #CBD5E1; border: none !important;
-            font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: 1px;
-            padding: 14px 18px;
-        }
-        table#ticketsTable thead th:first-child { border-radius: 12px 0 0 12px; }
-        table#ticketsTable thead th:last-child  { border-radius: 0 12px 12px 0; }
-        table#ticketsTable thead .sorting:before, table#ticketsTable thead .sorting_asc:before, table#ticketsTable thead .sorting_desc:before { color: var(--primary-orange); }
-        table#ticketsTable thead .sorting_asc:before, table#ticketsTable thead .sorting_desc:after { opacity: 1; color: var(--primary-orange); }
-
-        table#ticketsTable tbody tr { background: var(--white); transition: all .25s ease; animation: rowIn .4s ease both; }
-        table#ticketsTable tbody td {
-            padding: 14px 18px; border-top: 1px solid var(--border-color); border-bottom: 1px solid var(--border-color);
-            font-size: 13px; font-weight: 600; vertical-align: middle; background: transparent;
-        }
-        table#ticketsTable tbody td:first-child { border-left: 4px solid transparent; border-radius: 12px 0 0 12px; border-left-color: var(--border-color); border-left-width: 1px; border-left-style: solid; }
-        table#ticketsTable tbody td:last-child  { border-right: 1px solid var(--border-color); border-radius: 0 12px 12px 0; }
-        table#ticketsTable tbody tr:hover { transform: translateY(-2px) scale(1.003); box-shadow: 0 10px 26px rgba(10,25,47,.10); }
-        table#ticketsTable tbody tr:hover td { border-color: rgba(255,107,0,.45); background: #FFFDFB; }
-        table#ticketsTable tbody tr:hover td:first-child { border-left: 4px solid var(--primary-orange); }
-        table#ticketsTable tbody tr.row-parked td:first-child { border-left: 4px solid #0284C7; }
-        table#ticketsTable tbody tr.row-vip td:first-child { border-left: 4px solid #D97706; }
-        table#ticketsTable tbody tr.row-parked:hover td:first-child, table#ticketsTable tbody tr.row-vip:hover td:first-child { border-left-color: var(--primary-orange); }
-        table.dataTable.display tbody tr.odd > .sorting_1, table.dataTable.display tbody tr.even > .sorting_1 { background: transparent; }
-        @keyframes rowIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
-
-        /* Ticket code */
-        .ticket-chip {
-            display: inline-flex; align-items: center; gap: 8px; font-family: 'Courier New', monospace;
-            font-weight: 800; font-size: 12.5px; color: var(--navy-blue); letter-spacing: .5px;
-            background: var(--soft-blue-bg); padding: 7px 12px; border-radius: 10px; border: 1px dashed #BFDBFE;
-        }
-        .ticket-chip i { color: var(--primary-orange); font-size: 12px; }
-
-        /* Number plate */
-        .plate {
-            display: inline-flex; align-items: stretch; background: #FFFBEB; color: var(--navy-blue);
-            border: 2px solid var(--navy-blue); border-radius: 8px; overflow: hidden;
-            font-weight: 800; font-size: 13px; letter-spacing: 1.5px; text-transform: uppercase;
-            box-shadow: 0 2px 0 rgba(10,25,47,.15);
-        }
-        .plate-side {
-            background: var(--navy-blue); color: var(--primary-orange); font-size: 8px; letter-spacing: 0;
-            padding: 0 6px; display: flex; align-items: center; justify-content: center;
-        }
-        .plate-no { padding: 5px 12px; font-family: 'Courier New', monospace; }
-
-        /* Vehicle type */
-        .vtype { display: inline-flex; align-items: center; gap: 10px; font-weight: 700; color: var(--text-dark); }
-        .vtype-ico {
-            width: 34px; height: 34px; border-radius: 50%; background: #FFF1E6; color: var(--primary-orange);
-            display: flex; align-items: center; justify-content: center; font-size: 14px; transition: all .3s ease;
-        }
-        tr:hover .vtype-ico { background: var(--primary-orange); color: var(--white); transform: rotate(-10deg) scale(1.08); }
-
-        /* Duration & fee */
-        .fee-box { display: flex; flex-direction: column; gap: 3px; }
-        .fee-amount { font-size: 14px; font-weight: 800; color: var(--navy-blue); }
-        .fee-amount small { font-size: 10px; color: var(--text-muted); font-weight: 700; margin-right: 3px; }
-        .fee-dur { font-size: 11.5px; color: var(--text-muted); font-weight: 700; display: flex; align-items: center; gap: 5px; }
-        .fee-dur i { color: var(--primary-orange); }
-        .parked-now { display: inline-flex; align-items: center; gap: 8px; color: #0284C7; font-weight: 800; font-size: 12.5px; }
-        .parked-now .dot-live { width: 8px; height: 8px; border-radius: 50%; background: #0284C7; animation: pulseBlue 1.6s infinite; }
-        @keyframes pulseBlue {
-            0% { box-shadow: 0 0 0 0 rgba(2,132,199,.55); } 70% { box-shadow: 0 0 0 8px rgba(2,132,199,0); } 100% { box-shadow: 0 0 0 0 rgba(2,132,199,0); }
-        }
-
-        /* Pass type */
-        .vip-crown {
-            display: inline-flex; align-items: center; gap: 6px; padding: 6px 12px; border-radius: 20px;
-            font-size: 11px; font-weight: 800; color: var(--white);
-            background: linear-gradient(135deg, #D97706, #FBBF24); box-shadow: 0 4px 12px rgba(217,119,6,.35);
-        }
-        .std-pass { color: var(--text-muted); font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; gap: 6px; }
-
-        /* Status pills */
-        .status-pill {
-            display: inline-flex; align-items: center; gap: 7px; padding: 6px 13px; border-radius: 20px;
-            font-size: 11.5px; font-weight: 800; white-space: nowrap;
-        }
-        .status-pill .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; display: inline-block; }
-        .st-parked { background: #E0F2FE; color: #0284C7; }
-        .st-done   { background: #DCFCE7; color: #16A34A; }
-        .st-warn   { background: #FEF3C7; color: #D97706; }
-        .st-danger { background: #FEE2E2; color: #DC2626; }
-        .st-muted  { background: #F1F5F9; color: var(--text-muted); }
-
-        /* Bottom bar & pagination */
-        .dataTables_wrapper .dt-bottom { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; padding-top: 14px; }
-        .dataTables_wrapper .dataTables_info { padding: 0; font-size: 12.5px; font-weight: 700; color: var(--text-muted); }
-        .dataTables_wrapper .dataTables_paginate { padding: 0; display: flex; gap: 6px; }
-        .table-container-card .dataTables_wrapper .dataTables_paginate .paginate_button {
-            min-width: 38px; height: 38px; padding: 0 12px !important; margin: 0 !important; border-radius: 10px !important;
-            border: 1.5px solid var(--border-color) !important; background: var(--white) !important; color: var(--navy-blue) !important;
-            font-size: 13px; font-weight: 800; display: inline-flex; align-items: center; justify-content: center; box-shadow: none !important; transition: all .2s ease;
-        }
-        .table-container-card .dataTables_wrapper .dataTables_paginate .paginate_button:hover {
-            background: var(--soft-blue-bg) !important; border-color: var(--primary-orange) !important; color: var(--primary-orange) !important; transform: translateY(-2px);
-        }
-        .table-container-card .dataTables_wrapper .dataTables_paginate .paginate_button.current,
-        .table-container-card .dataTables_wrapper .dataTables_paginate .paginate_button.current:hover {
-            background: linear-gradient(135deg, var(--primary-orange), #FF8800) !important; border-color: transparent !important;
-            color: var(--white) !important; box-shadow: 0 6px 14px rgba(255,107,0,.35) !important;
-        }
-        .table-container-card .dataTables_wrapper .dataTables_paginate .paginate_button.disabled,
-        .table-container-card .dataTables_wrapper .dataTables_paginate .paginate_button.disabled:hover {
-            opacity: .4; cursor: not-allowed; background: var(--bg-light) !important; color: var(--text-muted) !important; border-color: var(--border-color) !important; transform: none;
-        }
-        table.dataTable.dtr-inline.collapsed > tbody > tr > td.dtr-control:before { background-color: var(--primary-orange); box-shadow: none; border: 2px solid var(--white); }
-        table.dataTable > tbody > tr.child ul.dtr-details { width: 100%; }
-
-        @media (max-width: 768px) {
-            .table-responsive { padding: 6px 12px 16px; }
-            .filter-chips { width: 100%; overflow-x: auto; }
-            .dataTables_wrapper .dataTables_filter input { width: 100%; }
-            .dataTables_wrapper .dataTables_filter { width: 100%; }
-        }
-
-        /* =====================================================================
-           RESPONSIVE LAYER  (tablet + mobile)  -  desktop look is untouched
-           ===================================================================== */
-        html { -webkit-text-size-adjust: 100%; }
-
-        /* ---------- Tablet & below (<= 992px): sidebar becomes a slide-in drawer ---------- */
-        @media (max-width: 992px) {
-            .admin-dashboard-layout { flex-direction: column; }
-
-            .dashboard-sidebar {
-                position: fixed; top: 0; left: 0; bottom: 0;
-                width: 280px; max-width: 85vw; height: 100%;
-                transform: translateX(-100%); visibility: hidden;
-                transition: transform .3s ease, visibility 0s linear .3s;
-                z-index: 1001;
-                -webkit-overflow-scrolling: touch;
-                overscroll-behavior: contain;
-            }
-            .dashboard-sidebar.open {
-                transform: translateX(0); visibility: visible;
-                transition: transform .3s ease, visibility 0s;
-            }
-            .sidebar-menu-link { padding: 13px 16px; }
-            .sidebar-menu-link:hover { transform: none; }
-
-            .sidebar-close-btn {
-                display: flex; align-items: center; justify-content: center;
-                position: absolute; top: 14px; right: 12px;
-                width: 36px; height: 36px; border: none; border-radius: 10px; cursor: pointer;
-                background: rgba(255,255,255,.08); color: #CBD5E1; font-size: 16px;
-            }
-            .sidebar-close-btn:hover { background: rgba(255,255,255,.16); color: var(--white); }
-            .sidebar-brand-box { padding-right: 52px; }
-
-            .sidebar-overlay {
-                display: block; position: fixed; inset: 0; z-index: 1000;
-                background: rgba(10, 25, 47, .55); backdrop-filter: blur(2px);
-                opacity: 0; pointer-events: none; transition: opacity .3s ease;
-            }
-            .sidebar-overlay.show { opacity: 1; pointer-events: auto; }
-            body.nav-open { overflow: hidden; }
-
-            /* Sticky mobile top bar with hamburger */
-            .mobile-topbar {
-                display: flex; align-items: center; gap: 12px;
-                position: sticky; top: 10px; z-index: 900;
-                background: var(--navy-blue); color: var(--white);
-                padding: 10px 14px; border-radius: 14px;
-                box-shadow: 0 8px 22px rgba(10,25,47,.25);
-            }
-            .mobile-menu-btn {
-                width: 40px; height: 40px; flex-shrink: 0; border: none; cursor: pointer;
-                border-radius: 11px; font-size: 17px; color: var(--white);
-                background: linear-gradient(135deg, var(--primary-orange), #FF8800);
-                display: flex; align-items: center; justify-content: center;
-            }
-            .mobile-brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
-            .mobile-brand h2 { font-size: 16px; font-weight: 800; line-height: 1.1; color: var(--white); }
-            .mobile-brand h2 span { color: var(--primary-orange); }
-            .mobile-brand p { font-size: 9.5px; font-weight: 700; letter-spacing: .5px; text-transform: uppercase; color: #94A3B8; }
-
-            .dashboard-workspace { padding: 16px 20px 28px; gap: 16px; }
-
-            /* Analytics: 3 + 2 tiles on tablet */
-            .analytics-strip-container { grid-template-columns: repeat(6, 1fr); gap: 10px; padding: 12px; }
-            .analytics-segment {
-                grid-column: span 2; min-width: 0;
-                border: 1px solid var(--border-color); background: var(--bg-light);
-                padding: 12px 14px;
-            }
-            .analytics-segment:nth-child(4), .analytics-segment:nth-child(5) { grid-column: span 3; }
-            .analytics-segment:last-child { border-right: 1px solid var(--border-color); }
-            .analytics-segment:hover { transform: none; }
-            .segment-details { min-width: 0; }
-            .segment-details h3 { white-space: nowrap; }
-
-            /* Table rows: no hover-jump on touch screens */
-            table#ticketsTable tbody tr:hover { transform: none; box-shadow: none; }
-        }
-
-        /* ---------- Large phones / small tablets (<= 768px) ---------- */
-        @media (max-width: 768px) {
-            .mpcs-top-header { padding: 14px 16px; gap: 12px; flex-wrap: wrap; }
-            .mpcs-brand-info h1 { font-size: 17px; }
-
-            .toolbar-action-row { gap: 10px; }
-            .btn-toolbar-action { flex: 1 1 calc(50% - 10px); justify-content: center; padding: 12px 14px; }
-
-            .table-title-bar { padding: 18px 16px 6px; }
-            .table-title-bar h3 { font-size: 16px; flex-wrap: wrap; gap: 8px; }
-            .tt-left { min-width: 0; }
-            .tt-icon { width: 42px; height: 42px; font-size: 17px; flex-shrink: 0; }
-            .chip { flex: 1 0 auto; justify-content: center; white-space: nowrap; padding: 9px 14px; }
-
-            .table-responsive { overflow-x: auto; -webkit-overflow-scrolling: touch; }
-            .dataTables_wrapper .dt-top { flex-direction: column; align-items: stretch; padding: 10px 0; }
-            .dataTables_wrapper .dataTables_filter input { font-size: 16px; } /* stops iOS zoom-on-focus */
-            .dataTables_wrapper .dataTables_length { display: flex; align-items: center; justify-content: space-between; }
-            .dataTables_wrapper .dataTables_length label { display: flex; align-items: center; gap: 4px; }
-
-            table#ticketsTable thead th { padding: 12px 12px; }
-            table#ticketsTable tbody td { padding: 12px 12px; }
-            table#ticketsTable tbody tr.child td.child { padding: 10px 14px; border-left: 1px solid var(--border-color); }
-            table.dataTable > tbody > tr.child ul.dtr-details > li { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; padding: 9px 0; }
-            table.dataTable > tbody > tr.child span.dtr-title { min-width: 96px; color: var(--text-muted); font-size: 11px; text-transform: uppercase; letter-spacing: .6px; }
-
-            .dataTables_wrapper .dt-bottom { flex-direction: column; justify-content: center; text-align: center; }
-            .dataTables_wrapper .dataTables_paginate { flex-wrap: wrap; justify-content: center; }
-        }
-
-        /* ---------- Phones (<= 600px) ---------- */
-        @media (max-width: 600px) {
-            .dashboard-workspace { padding: 12px 12px 24px; gap: 14px; }
-            .mobile-topbar { top: 8px; padding: 9px 12px; }
-
-            .mpcs-top-header { flex-direction: column; align-items: stretch; border-left-width: 4px; }
-            .mpcs-clock-card { justify-content: center; }
-
-            .analytics-strip-container { grid-template-columns: repeat(2, 1fr); padding: 10px; gap: 8px; }
-            .analytics-segment,
-            .analytics-segment:nth-child(4),
-            .analytics-segment:nth-child(5) { grid-column: span 1; gap: 10px; padding: 10px 12px; }
-            .analytics-segment:last-child { grid-column: 1 / -1; }
-            .segment-icon-pill { width: 36px; height: 36px; font-size: 14px; }
-            .segment-details span { font-size: 10px; }
-            .segment-details h3 { font-size: 18px; }
-
-            .btn-toolbar-action { font-size: 12.5px; padding: 12px 10px; }
-
-            .table-container-card { border-radius: 14px; }
-            .table-title-bar p { font-size: 11.5px; }
-            .table-responsive { padding: 4px 10px 14px; }
-            .ticket-chip { font-size: 12px; padding: 6px 10px; }
-            .plate-no { padding: 4px 10px; }
-            .table-container-card .dataTables_wrapper .dataTables_paginate .paginate_button { min-width: 36px; height: 36px; padding: 0 10px !important; }
-        }
-
-        /* ---------- Very small phones (<= 380px) ---------- */
-        @media (max-width: 380px) {
-            .mobile-brand p { display: none; }
-            .chip { padding: 9px 10px; font-size: 12px; }
-            .chip i { display: none; }
-            .segment-details h3 { font-size: 16px; }
-        }
-
-        /* Respect reduced-motion preference on touch devices */
-        @media (prefers-reduced-motion: reduce) {
-            .dashboard-sidebar, .sidebar-overlay { transition: none; }
-        }
-    </style>
-<?php include __DIR__ . "/includes/pwa.php"; ?></head>
-<body>
-
-<div class="admin-dashboard-layout">
-
-    <div class="sidebar-overlay" id="sidebarOverlay"></div>
-
-    <aside class="dashboard-sidebar" id="dashboardSidebar">
-        <button type="button" class="sidebar-close-btn" id="sidebarClose" aria-label="Close menu"><i class="fa-solid fa-xmark"></i></button>
+    .total-fee-badge {
+        background: rgba(255, 107, 0, 0.1); border: 1px solid rgba(255, 107, 0, 0.3);
+        border-radius: 16px; padding: 15px; text-align: center; margin-top: 15px;
+    }
+    .total-fee-amount { font-size: 30px; font-weight: 800; color: var(--accent-orange); }
+
+    .btn-submit {
+        width: 100%; background: var(--orange-gradient);
+        color: white; border: none; padding: 16px; border-radius: 16px; font-size: 16px; font-weight: 700; cursor: pointer;
+        box-shadow: 0 8px 25px rgba(255, 122, 26, 0.3); transition: transform 0.25s ease, box-shadow 0.25s ease;
+        position: relative; overflow: hidden;
+    }
+    .btn-submit::after, .btn-complete::after {
+        content: ''; position: absolute; inset: 0;
+        background: linear-gradient(120deg, transparent 30%, rgba(255,255,255,0.35) 50%, transparent 70%);
+        background-size: 200px 100%; background-repeat: no-repeat;
+        animation: shimmer 2.6s ease-in-out infinite;
+    }
+    .btn-submit:hover { transform: translateY(-2px); box-shadow: 0 10px 28px rgba(255, 122, 26, 0.4); }
+
+    .btn-complete {
+        width: 100%; background: linear-gradient(135deg, var(--accent-green), #0FA968);
+        color: white; border: none; padding: 18px; border-radius: 16px; font-size: 18px; font-weight: 700; cursor: pointer; margin-top: 15px;
+        box-shadow: 0 8px 25px rgba(23, 199, 133, 0.3); transition: transform 0.25s ease, box-shadow 0.25s ease;
+        position: relative; overflow: hidden;
+    }
+    .btn-complete:hover { transform: translateY(-2px); box-shadow: 0 10px 28px rgba(23, 199, 133, 0.4); }
+
+    /* Side Panel Elements (Rates & Quick Tools) */
+    .side-panel { display: flex; flex-direction: column; gap: 20px; }
+    
+    .panel-card {
+        background: var(--card-bg); border-radius: 20px; padding: 22px;
+        border: 1px solid var(--border-color); box-shadow: 0 6px 20px rgba(0,0,0,0.03);
+    }
+    .panel-title {
+        font-size: 15px; font-weight: 700; color: var(--text-color); margin-bottom: 15px;
+        display: flex; align-items: center; gap: 10px;
+    }
+
+    .rate-item {
+        display: flex; justify-content: space-between; align-items: center;
+        padding: 10px 0; border-bottom: 1px dashed var(--border-color); font-size: 13px; font-weight: 600;
+    }
+    .rate-item:last-child { border-bottom: none; }
+
+    .quick-action-btn {
+        width: 100%; display: flex; align-items: center; gap: 12px; padding: 12px 15px;
+        background: #F8FAFC; border: 1px solid var(--border-color); border-radius: 12px;
+        color: var(--text-color); font-weight: 600; font-size: 13px; cursor: pointer; transition: 0.3s; margin-bottom: 10px;
+    }
+    .quick-action-btn:hover { background: var(--accent-blue); color: white; border-color: var(--accent-blue); }
+
+    /* Recent Prints List */
+    .recent-print-item {
+        background: #F8FAFC; border-radius: 12px; padding: 12px; margin-bottom: 10px;
+        display: flex; justify-content: space-between; align-items: center; font-size: 13px;
+    }
+
+    /* Alert Boxes */
+    .alert-box {
+        padding: 16px 20px; border-radius: 16px; margin-bottom: 25px;
+        font-weight: 600; text-align: center; display: flex; align-items: center; justify-content: center; gap: 10px;
+        animation: fadeSlideUp 0.4s ease both;
+    }
+    .alert-error { background: rgba(240, 69, 95, 0.1); color: var(--accent-red); border: 1px solid rgba(240, 69, 95, 0.2); }
+    .alert-success { background: rgba(23, 199, 133, 0.1); color: var(--accent-green); border: 1px solid rgba(23, 199, 133, 0.2); }
+
+    /* Thank-You Checkout Card */
+    .thankyou-card {
+        background: linear-gradient(160deg, #ffffff, #F6F4FE);
+        border: 1px solid var(--border-color); border-radius: 24px;
+        padding: 30px 28px; margin-bottom: 24px; text-align: center;
+        box-shadow: 0 16px 40px rgba(23,18,58,0.10);
+        position: relative; overflow: hidden;
+        animation: popIn 0.5s ease both;
+    }
+    .thankyou-card::before {
+        content: ''; position: absolute; top: 0; left: 0; width: 100%; height: 6px;
+        background: linear-gradient(90deg, var(--accent-green), var(--accent-blue), var(--accent-orange), var(--accent-green));
+        background-size: 300% 100%;
+        animation: bgDrift 6s linear infinite;
+    }
+    .thankyou-check {
+        width: 64px; height: 64px; border-radius: 50%; margin: 4px auto 14px auto;
+        background: linear-gradient(135deg, var(--accent-green), #0FA968);
+        color: #fff; display: flex; align-items: center; justify-content: center;
+        font-size: 28px; box-shadow: 0 8px 22px rgba(23,199,133,0.4);
+        animation: popIn 0.5s ease 0.1s both, softPulse 2.2s ease-in-out 0.6s infinite;
+    }
+    .thankyou-title { font-size: 21px; font-weight: 800; color: var(--text-color); margin: 0 0 4px 0; }
+    .thankyou-sub { font-size: 13px; color: var(--sub-text); margin: 0 0 20px 0; }
+    .thankyou-grid {
+        background: #F8FAFC; border: 1px solid var(--border-color); border-radius: 16px;
+        padding: 16px 18px; text-align: left; margin: 0 auto 18px auto; max-width: 380px;
+    }
+    .thankyou-row { display: flex; justify-content: space-between; gap: 10px; padding: 6px 0; font-size: 13px; }
+    .thankyou-row:not(:last-child) { border-bottom: 1px dashed var(--border-color); }
+    .thankyou-row span:first-child { color: var(--sub-text); }
+    .thankyou-row span:last-child, .thankyou-row strong { font-weight: 700; color: var(--text-color); }
+    .thankyou-fee {
+        display: inline-block; margin: 0 auto 20px auto; padding: 14px 28px; border-radius: 16px;
+        background: rgba(23,199,133,0.10); border: 1px solid rgba(23,199,133,0.25);
+    }
+    .thankyou-fee .label { display: block; font-size: 11px; font-weight: 700; color: var(--sub-text); letter-spacing: .4px; }
+    .thankyou-fee .amount { font-size: 26px; font-weight: 800; color: var(--accent-green); }
+    .thankyou-actions { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
+    .thankyou-actions .btn-print-receipt {
+        background: var(--dark-navy); color: #fff; border: none; padding: 12px 20px; border-radius: 12px;
+        font-weight: 700; font-size: 13px; cursor: pointer; display: inline-flex; align-items: center; gap: 8px;
+        transition: transform 0.2s ease;
+    }
+    .thankyou-actions .btn-print-receipt:hover { transform: translateY(-2px); }
+    .thankyou-actions .btn-next-vehicle {
+        background: var(--orange-gradient); color: #fff; text-decoration: none; border: none;
+        padding: 12px 20px; border-radius: 12px; font-weight: 700; font-size: 13px;
+        display: inline-flex; align-items: center; gap: 8px; transition: transform 0.2s ease;
+    }
+    .thankyou-actions .btn-next-vehicle:hover { transform: translateY(-2px); }
+
+    /* Print Styling */
+    .receipt-print-area { display: none; }
+    @media print {
+        @page { size: 80mm 120mm; margin: 0; }
+        html, body { margin: 0 !important; padding: 0 !important; height: auto !important; overflow: hidden !important; }
+        body > *:not(.receipt-print-area) { display: none !important; }
+        .receipt-print-area {
+            display: block !important; position: static; width: 80mm;
+            font-family: monospace; page-break-after: avoid; page-break-inside: avoid; break-inside: avoid;
+        }
+    }
+
+    /* Thermal Receipt Design (Highway-ticket sized) */
+    .receipt-print-area {
+        padding: 4mm 4mm; color: #000; font-family: 'Courier New', monospace;
+        box-sizing: border-box;
+    }
+    .rcpt-logo {
+        width: 24px; height: 24px; border-radius: 50%; border: 1.5px solid #000;
+        display: flex; align-items: center; justify-content: center; margin: 0 auto 4px auto;
+        font-size: 12px;
+    }
+    .rcpt-brand { text-align: center; font-size: 13px; font-weight: 700; letter-spacing: 1.5px; margin: 0; }
+    .rcpt-sub { text-align: center; font-size: 8px; margin: 2px 0 0 0; }
+    .rcpt-meta { text-align: center; font-size: 7.5px; margin: 1px 0 0 0; color: #333; }
+    .rcpt-divider { border: none; border-top: 1px dashed #000; margin: 5px 0; }
+    .rcpt-divider.dotted { border-top: 1px dotted #000; }
+    .rcpt-status {
+        text-align: center; font-size: 9px; font-weight: 700; letter-spacing: 0.5px;
+        border: 1px solid #000; border-radius: 14px; padding: 2px 0; margin-bottom: 5px;
+    }
+    .rcpt-row { display: flex; justify-content: space-between; font-size: 9.5px; padding: 1.5px 0; }
+    .rcpt-row .rcpt-label { color: #333; }
+    .rcpt-row .rcpt-value { font-weight: 700; text-align: right; }
+    .rcpt-total-box {
+        border: 1px solid #000; border-radius: 4px; text-align: center;
+        padding: 4px 0; margin: 6px 0 5px 0;
+    }
+    .rcpt-total-label { font-size: 8px; letter-spacing: 1px; }
+    .rcpt-total-amount { font-size: 15px; font-weight: 700; margin-top: 1px; }
+    .rcpt-thanks { text-align: center; font-size: 9.5px; font-weight: 700; margin: 3px 0 1px 0; }
+    .rcpt-thanks-sub { text-align: center; font-size: 7.5px; margin: 0; }
+</style>
+
+<!-- Terminal Header Bar -->
+<div class="terminal-header no-print">
+    <div class="terminal-info">
+        <div class="exit-avatar"><i class="fa-solid fa-right-from-bracket"></i></div>
         <div>
-            <a href="index.php" class="sidebar-brand-box">
-                <div class="sidebar-brand-icon">
-                    <i class="fa-solid fa-square-parking"></i>
-                </div>
-                <div class="sidebar-brand-text">
-                    <h2>PARK<span>SMART</span></h2>
-                    <p>Ambalangoda MPCS</p>
-                </div>
-            </a>
-
-            <div class="menu-category-label">Gate Terminals</div>
-            <ul class="sidebar-menu-list">
-                <li><a href="index.php" class="sidebar-menu-link"><i class="fa-solid fa-ticket"></i> Entry Gate</a></li>
-                <li><a href="3D parking.php" class="sidebar-menu-link"><i class="fa-solid fa-cubes"></i> Parking Visualizer</a></li>
-                <li><a href="exit.php" class="sidebar-menu-link"><i class="fa-solid fa-right-from-bracket"></i> Exit Gate</a></li>
-                <li><a href="vip_request.php" class="sidebar-menu-link"><i class="fa-solid fa-crown"></i> VIP Pass Request</a></li>
-            </ul>
-
-            <div class="menu-category-label">Admin Controls</div>
-            <ul class="sidebar-menu-list">
-                <li><a href="admin_dashboard.php" class="sidebar-menu-link active"><i class="fa-solid fa-chart-pie"></i> Dashboard</a></li>
-                <li><a href="admin_security_users.php" class="sidebar-menu-link"><i class="fa-solid fa-user-shield"></i> Security Staff</a></li>
-                <li><a href="admin_vip_requests.php" class="sidebar-menu-link"><i class="fa-solid fa-crown"></i> VIP Approvals</a></li>
-                <li><a href="admin_reports.php" class="sidebar-menu-link"><i class="fa-solid fa-chart-column"></i> Revenue Reports</a></li>
-                 <li><a href="vehicle_investigation.php" class="sidebar-menu-link"><i class="fa-solid fa-shield-halved"></i> CID & Trace</a></li>
-            </ul>
+            <h2 style="font-size: 20px; font-weight: 700;">ParkSmart Exit Gate Terminal</h2>
+            <p style="font-size: 13px; color: rgba(255,255,255,0.75);"> Checkout & Gate Control</p>
         </div>
-
-        <div class="sidebar-bottom-wrapper">
-            <div class="sidebar-user-card">
-                <div class="sidebar-user-avatar"><i class="fa-solid fa-user-shield"></i></div>
-                <div>
-                    <h4 style="font-size:12px; font-weight:800;"><?php echo htmlspecialchars($display_name); ?></h4>
-                    <p style="font-size:10px; color:#FFB380;">Master Admin</p>
-                </div>
-            </div>
-            <a href="?action=logout" class="btn-sidebar-logout" onclick="return confirm('Logout වෙනවද?');">
-                <i class="fa-solid fa-right-from-bracket"></i> Logout
-            </a>
-        </div>
-    </aside>
-
-    <main class="dashboard-workspace">
-
-        <!-- Mobile / Tablet Top Bar (hidden on desktop) -->
-        <div class="mobile-topbar">
-            <button type="button" class="mobile-menu-btn" id="sidebarToggle" aria-label="Open menu" aria-controls="dashboardSidebar" aria-expanded="false"><i class="fa-solid fa-bars"></i></button>
-            <div class="mobile-brand">
-                <div>
-                    <h2>PARK<span>SMART</span></h2>
-                    <p>Ambalangoda MPCS</p>
-                </div>
-            </div>
-        </div>
-
-        <!-- Top Header -->
-        <header class="mpcs-top-header">
-            <div class="mpcs-brand-info">
-                <h1>Ambalangoda MPCS Ltd</h1>
-                <p><i class="fa-solid fa-location-dot" style="color:var(--primary-orange);"></i> Co-operative Parking Control Hub</p>
-            </div>
-            <div class="mpcs-clock-card">
-                <i class="fa-regular fa-clock" style="color:var(--primary-orange);"></i>
-                <div>
-                    <div class="clock-time" id="liveClock">00:00:00 AM</div>
-                    <div class="clock-date" id="liveDate">Loading...</div>
-                </div>
-            </div>
-        </header>
-
-        <!-- NO-CARD SLEEK METRICS STRIP -->
-        <div class="analytics-strip-container">
-            <div class="analytics-segment">
-                <div class="segment-icon-pill pill-blue"><i class="fa-solid fa-car"></i></div>
-                <div class="segment-details">
-                    <span>Parked Now</span>
-                    <h3><?php echo number_format($total_parked); ?></h3>
-                </div>
-            </div>
-
-            <div class="analytics-segment">
-                <div class="segment-icon-pill pill-amber"><i class="fa-solid fa-crown"></i></div>
-                <div class="segment-details">
-                    <span>VIP Active</span>
-                    <h3><?php echo number_format($vip_parked); ?></h3>
-                </div>
-            </div>
-
-            <div class="analytics-segment">
-                <div class="segment-icon-pill pill-emerald"><i class="fa-solid fa-circle-check"></i></div>
-                <div class="segment-details">
-                    <span>Completed</span>
-                    <h3><?php echo number_format($total_completed); ?></h3>
-                </div>
-            </div>
-
-            <div class="analytics-segment">
-                <div class="segment-icon-pill pill-orange"><i class="fa-solid fa-clock-rotate-left"></i></div>
-                <div class="segment-details">
-                    <span>Pending VIP</span>
-                    <h3><?php echo number_format($pending_vip); ?></h3>
-                </div>
-            </div>
-
-            <div class="analytics-segment">
-                <div class="segment-icon-pill pill-purple"><i class="fa-solid fa-wallet"></i></div>
-                <div class="segment-details">
-                    <span>Revenue</span>
-                    <h3>LKR <?php echo number_format($total_revenue, 0); ?></h3>
-                </div>
-            </div>
-        </div>
-
-        <!-- Sleek Toolbar Action Row -->
-        <div class="toolbar-action-row">
-            <a href="index.php" class="btn-toolbar-action"><i class="fa-solid fa-plus" style="color:var(--primary-orange);"></i> New Entry</a>
-            <a href="exit.php" class="btn-toolbar-action"><i class="fa-solid fa-qrcode" style="color:#16A34A;"></i> Exit Scan</a>
-            <a href="admin_vip_requests.php" class="btn-toolbar-action"><i class="fa-solid fa-crown" style="color:#D97706;"></i> Review VIPs</a>
-            <a href="admin_reports.php" class="btn-toolbar-action"><i class="fa-solid fa-file-invoice" style="color:#9333EA;"></i> Accounts Report</a>
-        </div>
-
-        <!-- Terminal Operations Table -->
-        <section class="table-container-card">
-            <div class="table-title-bar">
-                <div class="tt-left">
-                    <div class="tt-icon"><i class="fa-solid fa-list-check"></i></div>
-                    <div>
-                        <h3>Live Parking Log <span class="live-pill"><span class="live-dot"></span>LIVE</span></h3>
-                        <p><?php echo number_format($tickets_total); ?> tickets recorded &middot; latest first</p>
-                    </div>
-                </div>
-                <div class="filter-chips" id="statusChips">
-                    <button type="button" class="chip active" data-filter="ALL"><i class="fa-solid fa-layer-group"></i> All</button>
-                    <button type="button" class="chip" data-filter="Parked"><i class="fa-solid fa-square-parking"></i> Parked</button>
-                    <button type="button" class="chip" data-filter="Completed"><i class="fa-solid fa-circle-check"></i> Completed</button>
-                    <button type="button" class="chip" data-filter="VIP"><i class="fa-solid fa-crown"></i> VIP</button>
-                </div>
-            </div>
-
-            <div class="table-responsive">
-                <table id="ticketsTable" class="display responsive nowrap" style="width:100%">
-                    <thead>
-                        <tr>
-                            <th>Ticket Code</th>
-                            <th>Vehicle No</th>
-                            <th>Vehicle Type</th>
-                            <th>Duration &amp; Fee</th>
-                            <th>Pass Type</th>
-                            <th>Status</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        <?php if ($tickets_result && $tickets_result->num_rows > 0): ?>
-                            <?php while ($row = $tickets_result->fetch_assoc()):
-                                $row_class = ($row['status'] === 'PARKED') ? 'row-parked' : '';
-                                if ($row['is_vip'] == 1) $row_class = 'row-vip';
-                                $fee_order = ($row['status'] === 'COMPLETED') ? (float)$row['total_fee'] : 0;
-                            ?>
-                                <tr class="<?php echo $row_class; ?>">
-                                    <td><span class="ticket-chip"><i class="fa-solid fa-ticket"></i><?php echo htmlspecialchars($row['ticket_code']); ?></span></td>
-                                    <td>
-                                        <span class="plate">
-                                            <span class="plate-side">LK</span>
-                                            <span class="plate-no"><?php echo htmlspecialchars($row['vehicle_number']); ?></span>
-                                        </span>
-                                    </td>
-                                    <td>
-                                        <span class="vtype">
-                                            <span class="vtype-ico"><i class="fa-solid <?php echo vehicle_icon($row['type_name']); ?>"></i></span>
-                                            <?php echo htmlspecialchars($row['type_name'] ?? 'General'); ?>
-                                        </span>
-                                    </td>
-                                    <td data-order="<?php echo $fee_order; ?>">
-                                        <?php if ($row['status'] === 'COMPLETED'): ?>
-                                            <div class="fee-box">
-                                                <span class="fee-amount"><small>LKR</small><?php echo number_format($row['total_fee'], 2); ?></span>
-                                                <span class="fee-dur"><i class="fa-regular fa-hourglass-half"></i><?php echo $row['duration_hours']; ?> Hrs</span>
-                                            </div>
-                                        <?php elseif ($row['status'] === 'PARKED'): ?>
-                                            <span class="parked-now"><span class="dot-live"></span>Parked Currently</span>
-                                        <?php else: ?>
-                                            <span class="std-pass">&mdash;</span>
-                                        <?php endif; ?>
-                                    </td>
-                                    <td>
-                                        <?php if ($row['is_vip'] == 1): ?>
-                                            <span class="vip-crown"><i class="fa-solid fa-crown"></i> VIP Pass</span>
-                                        <?php else: ?>
-                                            <span class="std-pass"><i class="fa-regular fa-id-card"></i> Standard</span>
-                                        <?php endif; ?>
-                                    </td>
-                                    <td><?php echo status_badge($row['status']); ?></td>
-                                </tr>
-                            <?php endwhile; ?>
-                        <?php endif; ?>
-                    </tbody>
-                </table>
-            </div>
-        </section>
-
-    </main>
+    </div>
+    <div class="live-clock-badge">
+        <i class="fa-regular fa-clock" style="color: var(--accent-orange);"></i>
+        <span id="liveClock"><?php echo date('Y-m-d H:i:s'); ?></span>
+    </div>
 </div>
 
+<!-- Alert Messages -->
+<?php if ($error_msg): ?>
+    <div class="alert-box alert-error no-print">
+        <i class="fa-solid fa-triangle-exclamation"></i> <?php echo $error_msg; ?>
+    </div>
+<?php endif; ?>
+
+<!-- LIVE SLOT AVAILABILITY CARDS -->
+<div class="slots-grid no-print">
+    <?php
+    $types_res = $conn->query("SELECT * FROM vehicle_types");
+    while($t_row = $types_res->fetch_assoc()):
+        $t_id   = $t_row['id'];
+        $t_name = $t_row['type_name'];
+
+        $p_count = $conn->query("SELECT COUNT(*) as c FROM tickets WHERE vehicle_type_id = $t_id AND status = 'PARKED' AND is_vip=0")->fetch_assoc()['c'];
+
+        $limit = 10;
+        if (stripos($t_name, 'bike') !== false) $limit = 20;
+        elseif (stripos($t_name, 'bus') !== false || stripos($t_name, 'lorry') !== false) $limit = 5;
+
+        $percentage = round(($p_count / $limit) * 100);
+        $bar_color = "var(--accent-green)";
+        if($percentage >= 80) $bar_color = "var(--accent-red)";
+        elseif($percentage >= 50) $bar_color = "var(--accent-orange)";
+
+        $icon = "fa-car";
+        if (stripos($t_name, 'bike') !== false) $icon = "fa-motorcycle";
+        elseif (stripos($t_name, 'bus') !== false || stripos($t_name, 'lorry') !== false) $icon = "fa-bus";
+    ?>
+    <div class="slot-card">
+        <div class="slot-card-header">
+            <span class="slot-card-title">
+                <i class="fa-solid <?php echo $icon; ?>"></i>
+                <?php echo htmlspecialchars($t_name); ?>
+            </span>
+            <span style="font-size: 13px; font-weight: 700; color: <?php echo $bar_color; ?>;">
+                <?php echo $p_count; ?> / <?php echo $limit; ?>
+            </span>
+        </div>
+        <div style="font-size: 12px; color: var(--sub-text); display: flex; justify-content: space-between;">
+            <span>ඉතිරි ඉඩ ප්‍රමාණය:</span>
+            <strong style="color: var(--text-color);"><?php echo ($limit - $p_count); ?> Slots</strong>
+        </div>
+        <div class="slot-progress-bg">
+            <div class="slot-progress-fill" style="width: <?php echo $percentage; ?>%; background: <?php echo $bar_color; ?>;"></div>
+        </div>
+    </div>
+    <?php endwhile; ?>
+
+    <?php
+    $vip_legacy = $conn->query("SELECT COUNT(*) AS c FROM tickets WHERE status='PARKED' AND is_vip=1")->fetch_assoc()['c'] ?? 0;
+    $vip_active = $conn->query("SELECT COUNT(*) AS c FROM vip_parking_sessions WHERE status='PARKED'")->fetch_assoc()['c'] ?? 0;
+    $vip_count = (int)$vip_legacy + (int)$vip_active;
+    $vip_limit = 5;
+    $vip_percentage = min(100, round(($vip_count / $vip_limit) * 100));
+    $vip_bar_color = $vip_percentage >= 80 ? 'var(--accent-red)' : ($vip_percentage >= 50 ? 'var(--accent-orange)' : 'var(--accent-green)');
+    ?>
+    <div class="slot-card">
+        <div class="slot-card-header">
+            <span class="slot-card-title"><i class="fa-solid fa-crown"></i> VIP Vehicle Zone</span>
+            <span style="font-size:13px;font-weight:700;color:<?php echo $vip_bar_color; ?>;"><?php echo $vip_count; ?> / <?php echo $vip_limit; ?></span>
+        </div>
+        <div style="font-size:12px;color:var(--sub-text);display:flex;justify-content:space-between;">
+            <span>Reserved VIP capacity:</span>
+            <strong style="color:var(--text-color);"><?php echo max(0,$vip_limit-$vip_count); ?> Slots Free</strong>
+        </div>
+        <div class="slot-progress-bg">
+            <div class="slot-progress-fill" style="width:<?php echo $vip_percentage; ?>%;background:<?php echo $vip_bar_color; ?>;"></div>
+        </div>
+    </div>
+</div>
+
+<!-- MAIN WORKSPACE GRID -->
+<div class="terminal-main-layout no-print">
+    
+    <!-- LEFT: EXIT PROCESS CARD -->
+    <div class="exit-card">
+
+        <?php if ($checkout_success): ?>
+        <div class="thankyou-card">
+            <div class="thankyou-check"><i class="fa-solid fa-check"></i></div>
+            <h3 class="thankyou-title">ස්තුතියි! Thank You!</h3>
+            <p class="thankyou-sub">නැවත එන්න 🙏 &nbsp;|&nbsp; Drive safe, see you again</p>
+
+            <?php if ($printed_vip): ?>
+                <div class="thankyou-grid">
+                    <div class="thankyou-row"><span>Vehicle Number:</span><strong><?php echo htmlspecialchars($printed_vip['vehicle_number']); ?></strong></div>
+                    <div class="thankyou-row"><span>Parking Zone:</span><strong><?php echo htmlspecialchars($printed_vip['slot_label']); ?></strong></div>
+                    <div class="thankyou-row"><span>Entry Time:</span><span><?php echo date('Y-m-d | h:i A', strtotime($printed_vip['entry_time'])); ?></span></div>
+                    <div class="thankyou-row"><span>Exit Time:</span><span><?php echo date('Y-m-d | h:i A', strtotime($printed_vip['exit_time'])); ?></span></div>
+                    <div class="thankyou-row"><span>Duration:</span><span><?php echo (int)$printed_vip['duration_minutes']; ?> Mins</span></div>
+                </div>
+                <div class="thankyou-fee">
+                    <span class="label">TOTAL PAYABLE</span>
+                    <div class="amount">FREE</div>
+                </div>
+            <?php elseif ($printed_ticket): ?>
+                <div class="thankyou-grid">
+                    <div class="thankyou-row"><span>Ticket Code:</span><strong><?php echo htmlspecialchars($printed_ticket['ticket_code']); ?></strong></div>
+                    <div class="thankyou-row"><span>Vehicle Number:</span><strong><?php echo htmlspecialchars($printed_ticket['vehicle_number']); ?></strong></div>
+                    <div class="thankyou-row"><span>Category:</span><span><?php echo htmlspecialchars($printed_ticket['type_name']); ?></span></div>
+                    <div class="thankyou-row"><span>Entry Time:</span><span><?php echo date('Y-m-d | h:i A', strtotime($printed_ticket['entry_time'])); ?></span></div>
+                    <div class="thankyou-row"><span>Exit Time:</span><span><?php echo date('Y-m-d | h:i A', strtotime($printed_ticket['exit_time'])); ?></span></div>
+                    <div class="thankyou-row"><span>Duration:</span><span><?php echo (int)$printed_ticket['duration_hours']; ?> Hrs</span></div>
+                </div>
+                <div class="thankyou-fee">
+                    <span class="label">TOTAL PAID</span>
+                    <div class="amount">LKR <?php echo number_format($printed_ticket['total_fee'], 2); ?></div>
+                </div>
+            <?php endif; ?>
+
+            <div class="thankyou-actions no-print">
+                <?php if ($printed_ticket || $printed_vip): ?>
+                <button type="button" class="btn-print-receipt" onclick="printReceipt();">
+                    <i class="fa-solid fa-print"></i> Print Receipt
+                </button>
+                <?php endif; ?>
+                <a href="exit.php" class="btn-next-vehicle">
+                    <i class="fa-solid fa-arrow-right"></i> Next Vehicle
+                </a>
+            </div>
+        </div>
+        <?php endif; ?>
+
+        <div class="search-mode-selector">
+            <div class="mode-btn active" id="btnNormalMode" onclick="setMode('normal')">
+                <i class="fa-solid fa-qrcode"></i> QR / Ticket Scan
+            </div>
+            <div class="mode-btn" id="btnLostMode" onclick="setMode('lost')">
+                <i class="fa-solid fa-file-circle-exclamation"></i> Lost Ticket Option
+            </div>
+        </div>
+
+        <form action="" method="POST" id="qrAutoForm">
+            <input type="hidden" name="qr_ticket_code" id="qr_ticket_code_input">
+        </form>
+
+        <form action="" method="POST">
+            <input type="hidden" name="is_lost_mode" id="is_lost_mode" value="0">
+
+            <div class="search-input-wrapper">
+                <i class="fa-solid fa-magnifying-glass" style="position: absolute; left: 18px; top: 50%; transform: translateY(-50%); color: var(--accent-orange);"></i>
+                <input type="text" name="search_query" id="search_input_field" class="search-input" placeholder="Ticket Code OR Vehicle Number (VIP = Plate Only)" required autofocus autocomplete="off">
+                
+                <button type="button" class="btn-qr-scan" id="qrScanBtn" onclick="toggleCameraScanner()">
+                    <i class="fa-solid fa-camera"></i> Scan QR
+                </button>
+            </div>
+
+            <div style="display: none; background: #000; border-radius: 16px; overflow: hidden; margin-bottom: 20px;" id="qrScannerBox">
+                <div id="reader"></div>
+            </div>
+
+            <button type="submit" name="search_ticket" class="btn-submit">
+                <i class="fa-solid fa-calculator"></i> Calculate Fee
+            </button>
+        </form>
+
+        <!-- Fee Calculation Result & Final Checkout -->
+        <?php if ($calculated_data && !$checkout_success): ?>
+        <form action="" method="POST">
+            <input type="hidden" name="record_type" value="<?php echo htmlspecialchars($calculated_data['record_type']); ?>">
+            <?php if ($calculated_data['record_type'] === 'VIP'): ?>
+                <input type="hidden" name="session_id" value="<?php echo (int)$calculated_data['session_id']; ?>">
+            <?php else: ?>
+                <input type="hidden" name="ticket_id" value="<?php echo (int)$calculated_data['ticket_id']; ?>">
+                <input type="hidden" name="duration_hours" value="<?php echo (int)$calculated_data['duration_hours']; ?>">
+                <input type="hidden" name="final_fee" value="<?php echo htmlspecialchars($calculated_data['calculated_fee']); ?>">
+            <?php endif; ?>
+
+            <div class="receipt-box">
+                <?php if ($calculated_data['record_type'] === 'VIP'): ?>
+
+                    <div style="background:linear-gradient(135deg,rgba(245,158,11,.12),rgba(255,255,255,.9));border:1px solid rgba(245,158,11,.35);border-radius:16px;padding:16px;margin-bottom:16px;text-align:center;">
+                        <div style="font-size:13px;font-weight:900;color:#B45309;letter-spacing:.5px;">
+                            <i class="fa-solid fa-crown"></i> VIP VEHICLE VERIFIED
+                        </div>
+                        <div style="font-size:11px;color:#64748B;margin-top:5px;">
+                            No ticket / QR is required. Verify the vehicle by its number plate.
+                        </div>
+                    </div>
+
+                    <div class="receipt-row">
+                        <span style="color:var(--sub-text);">Vehicle Number:</span>
+                        <strong style="font-size:17px;"><?php echo htmlspecialchars($calculated_data['vehicle_number']); ?></strong>
+                    </div>
+                    <div class="receipt-row">
+                        <span style="color:var(--sub-text);">Parking Zone:</span>
+                        <strong style="color:#B45309;"><?php echo htmlspecialchars($calculated_data['slot_label'] ?: 'VIP Zone'); ?></strong>
+                    </div>
+                    <div class="receipt-row">
+                        <span style="color:var(--sub-text);">Vehicle Category:</span>
+                        <span>VIP Vehicle</span>
+                    </div>
+                    <div class="receipt-row">
+                        <span style="color:var(--sub-text);">Entry Time:</span>
+                        <span><?php echo date('Y-m-d | h:i A',strtotime($calculated_data['entry_time'])); ?></span>
+                    </div>
+                    <div class="receipt-row">
+                        <span style="color:var(--sub-text);">Duration:</span>
+                        <span><?php echo $calculated_data['total_minutes']; ?> Mins (~<?php echo $calculated_data['duration_hours']; ?> Hrs)</span>
+                    </div>
+
+                    <div style="background:rgba(16,185,129,.10);color:#047857;border:1px solid rgba(16,185,129,.20);padding:12px;border-radius:12px;font-size:13px;font-weight:800;text-align:center;margin-top:12px;">
+                        <i class="fa-solid fa-shield-halved"></i> AUTHORIZED VIP — PARKING FEE IS FREE
+                    </div>
+
+                    <div class="total-fee-badge" style="border-color:rgba(16,185,129,.3);background:rgba(16,185,129,.08);">
+                        <span style="font-size:12px;color:var(--sub-text);font-weight:700;">TOTAL PAYABLE</span>
+                        <div class="total-fee-amount" style="color:var(--accent-green);">LKR 0.00</div>
+                    </div>
+
+                    <button type="submit" name="process_checkout" class="btn-complete">
+                        <i class="fa-solid fa-shield-check"></i> Verify VIP &amp; Open Gate
+                    </button>
+
+                <?php else: ?>
+
+                    <div class="receipt-row">
+                        <span style="color: var(--sub-text);">Ticket Code:</span>
+                        <strong style="color: var(--accent-orange);"><?php echo htmlspecialchars($calculated_data['ticket_code']); ?></strong>
+                    </div>
+                    <div class="receipt-row">
+                        <span style="color: var(--sub-text);">Vehicle Number:</span>
+                        <span style="font-size: 16px; font-weight: 800;"><?php echo htmlspecialchars($calculated_data['vehicle_number']); ?></span>
+                    </div>
+                    <div class="receipt-row">
+                        <span style="color: var(--sub-text);">Vehicle Category:</span>
+                        <span><?php echo htmlspecialchars($calculated_data['category']); ?></span>
+                    </div>
+                    <div class="receipt-row">
+                        <span style="color: var(--sub-text);">Duration:</span>
+                        <span><?php echo $calculated_data['total_minutes']; ?> Mins (~<?php echo $calculated_data['duration_hours']; ?> Hrs)</span>
+                    </div>
+
+                    <?php if (!$calculated_data['is_grace']): ?>
+                    <div class="receipt-row" style="font-size:12px;color:var(--sub-text);">
+                        <span>Fee Breakdown:</span>
+                        <span>
+                            1st Hr @ LKR <?php echo number_format($calculated_data['hourly_rate'], 2); ?>
+                            <?php if ($calculated_data['duration_hours'] > 1): ?>
+                                + <?php echo $calculated_data['duration_hours'] - 1; ?> Hr(s) @ LKR <?php echo number_format(ADDITIONAL_HOUR_RATE, 2); ?>
+                            <?php endif; ?>
+                        </span>
+                    </div>
+                    <?php endif; ?>
+
+                    <?php if ($calculated_data['is_grace']): ?>
+                        <div style="background: rgba(16, 185, 129, 0.1); color: var(--accent-green); padding: 10px; border-radius: 10px; font-size: 13px; font-weight: 700; text-align: center; margin-top: 10px;">
+                            <i class="fa-solid fa-circle-check"></i> GRACE PERIOD APPLIED (FREE UNDER 15 MINS)
+                        </div>
+                    <?php endif; ?>
+
+                    <?php if (!empty($calculated_data['is_vip']) && !$calculated_data['is_lost']): ?>
+                        <div style="background: rgba(245, 158, 11, 0.1); color: #D97706; padding: 10px; border-radius: 10px; font-size: 13px; font-weight: 700; text-align: center; margin-top: 10px;">
+                            <i class="fa-solid fa-crown"></i> VIP FREE PASS APPLIED
+                        </div>
+                    <?php endif; ?>
+
+                    <?php if ($calculated_data['is_lost']): ?>
+                        <div style="background: rgba(239, 68, 68, 0.1); color: var(--accent-red); padding: 10px; border-radius: 10px; font-size: 13px; font-weight: 700; text-align: center; margin-top: 10px;">
+                            <i class="fa-solid fa-circle-exclamation"></i> LOST TICKET — NO FINE, STANDARD PARKING FEE APPLIES
+                        </div>
+                    <?php endif; ?>
+
+                    <div class="total-fee-badge">
+                        <span style="font-size: 12px; color: var(--sub-text); font-weight: 700;">TOTAL PAYABLE</span>
+                        <div class="total-fee-amount">LKR <?php echo number_format($calculated_data['calculated_fee'], 2); ?></div>
+                    </div>
+
+                    <button type="submit" name="process_checkout" class="btn-complete">
+                        <i class="fa-solid fa-door-open"></i> Complete &amp; Open Gate
+                    </button>
+
+                <?php endif; ?>
+            </div>
+        </form>
+        <?php endif; ?>
+    </div>
+
+    <!-- RIGHT: HELPFUL SIDE PANELS FOR OPERATOR -->
+    <div class="side-panel">
+        
+        <!-- PARKING RATES CARD -->
+        <div class="panel-card">
+            <div class="panel-title">
+                <i class="fa-solid fa-tags" style="color: var(--accent-orange);"></i> Standard Rate Card
+            </div>
+            <?php
+            $rates_q = $conn->query("SELECT * FROM vehicle_types");
+            while($r = $rates_q->fetch_assoc()):
+            ?>
+            <div class="rate-item">
+                <span><?php echo $r['type_name']; ?></span>
+                <span style="color: var(--accent-blue);">LKR <?php echo number_format($r['hourly_rate'], 2); ?> / 1st hr</span>
+            </div>
+            <?php endwhile; ?>
+            <div class="rate-item" style="color: var(--accent-orange);">
+                <span>Each Additional Hour</span>
+                <span>LKR <?php echo number_format(ADDITIONAL_HOUR_RATE, 2); ?> / hr</span>
+            </div>
+            <div class="rate-item" style="color: var(--accent-green);">
+                <span>Free Grace Period</span>
+                <span><?php echo GRACE_PERIOD_MINUTES; ?> Mins</span>
+            </div>
+        </div>
+
+        <!-- QUICK ASSISTANCE & SHORTCUTS -->
+        <div class="panel-card">
+            <div class="panel-title">
+                <i class="fa-solid fa-bolt" style="color: var(--accent-orange);"></i> Quick Gate Actions
+            </div>
+            <button class="quick-action-btn" onclick="alert('Gate Barrier Override Triggered! Opening gate manually...');">
+                <i class="fa-solid fa-torii-gate" style="color: var(--accent-green);"></i> Emergency Gate Open
+            </button>
+            <button class="quick-action-btn" onclick="setMode('lost'); document.getElementById('search_input_field').focus();">
+                <i class="fa-solid fa-file-circle-exclamation" style="color: var(--accent-red);"></i> Process Lost Ticket
+            </button>
+        </div>
+
+        <!-- RECENT EXIT LOG (MINI VIEW FOR QUICK RE-PRINT) -->
+        <div class="panel-card">
+            <div class="panel-title">
+                <i class="fa-solid fa-history" style="color: var(--accent-orange);"></i> Recent Gate Exits
+            </div>
+            <?php
+            $today_date = date('Y-m-d');
+            $recent_exits = $conn->query("SELECT t.*, vt.type_name FROM tickets t JOIN vehicle_types vt ON t.vehicle_type_id = vt.id WHERE t.status = 'COMPLETED' AND DATE(t.exit_time) = '$today_date' ORDER BY t.exit_time DESC LIMIT 3");
+            
+            if($recent_exits && $recent_exits->num_rows > 0):
+                while($rx = $recent_exits->fetch_assoc()):
+            ?>
+            <div class="recent-print-item">
+                <div>
+                    <strong style="display:block;"><?php echo $rx['vehicle_number']; ?></strong>
+                    <span style="font-size: 11px; color: var(--sub-text);"><?php echo date('h:i A', strtotime($rx['exit_time'])); ?> | LKR <?php echo number_format($rx['total_fee'], 2); ?></span>
+                </div>
+                <span style="font-size: 11px; background: rgba(16, 185, 129, 0.1); color: var(--accent-green); padding: 3px 8px; border-radius: 6px; font-weight: 700;">PASSED</span>
+            </div>
+            <?php endwhile; else: ?>
+                <div style="font-size: 12px; color: var(--sub-text); text-align: center; padding: 10px;">නෑවත Exit වූ වාහන සටහන් නොමැත.</div>
+            <?php endif; ?>
+        </div>
+
+    </div>
+
+</div>
+
+<!-- PRINTABLE THERMAL RECEIPT (FOR COMPLETED CHECKOUT) -->
+<?php if($printed_ticket): ?>
+<div class="receipt-print-area" id="printableReceipt">
+    <p class="rcpt-brand">PARK SMART</p>
+    <p class="rcpt-sub"></p>
+    <p class="rcpt-meta">Exit Receipt &nbsp;•&nbsp; <?php echo date('Y-m-d h:i A'); ?></p>
+
+    <hr class="rcpt-divider">
+
+    <div class="rcpt-status">EXIT AUTHORIZED</div>
+
+    <div class="rcpt-row"><span class="rcpt-label">Ticket Code</span><span class="rcpt-value"><?php echo $printed_ticket['ticket_code']; ?></span></div>
+    <div class="rcpt-row"><span class="rcpt-label">Vehicle No</span><span class="rcpt-value"><?php echo $printed_ticket['vehicle_number']; ?></span></div>
+    <div class="rcpt-row"><span class="rcpt-label">Category</span><span class="rcpt-value"><?php echo $printed_ticket['type_name']; ?></span></div>
+
+    <hr class="rcpt-divider dotted">
+
+    <div class="rcpt-row"><span class="rcpt-label">Entry</span><span class="rcpt-value"><?php echo date('m-d h:i A', strtotime($printed_ticket['entry_time'])); ?></span></div>
+    <div class="rcpt-row"><span class="rcpt-label">Exit</span><span class="rcpt-value"><?php echo date('m-d h:i A', strtotime($printed_ticket['exit_time'])); ?></span></div>
+    <div class="rcpt-row"><span class="rcpt-label">Duration</span><span class="rcpt-value"><?php echo $printed_ticket['duration_hours']; ?> Hour(s)</span></div>
+
+    <div class="rcpt-total-box">
+        <div class="rcpt-total-label">TOTAL PAID</div>
+        <div class="rcpt-total-amount">LKR <?php echo number_format($printed_ticket['total_fee'], 2); ?></div>
+    </div>
+
+    <p class="rcpt-thanks">ස්තුතියි! &nbsp;Thank You!</p>
+    <p class="rcpt-thanks-sub">නැවත එන්න &nbsp;•&nbsp; Drive Safe &nbsp;•&nbsp; See You Again</p>
+</div>
+<?php endif; ?>
+
+<?php if($printed_vip): ?>
+<div class="receipt-print-area" id="printableReceipt">
+    <p class="rcpt-brand">PARK SMART</p>
+    <p class="rcpt-sub"></p>
+    <p class="rcpt-meta">VIP Exit Receipt &nbsp;•&nbsp; <?php echo date('Y-m-d h:i A'); ?></p>
+
+    <hr class="rcpt-divider">
+
+    <div class="rcpt-status">VIP EXIT AUTHORIZED</div>
+
+    <div class="rcpt-row"><span class="rcpt-label">Vehicle No</span><span class="rcpt-value"><?php echo $printed_vip['vehicle_number']; ?></span></div>
+    <div class="rcpt-row"><span class="rcpt-label">Category</span><span class="rcpt-value">VIP Vehicle</span></div>
+    <div class="rcpt-row"><span class="rcpt-label">Zone</span><span class="rcpt-value"><?php echo $printed_vip['slot_label']; ?></span></div>
+
+    <hr class="rcpt-divider dotted">
+
+    <div class="rcpt-row"><span class="rcpt-label">Entry</span><span class="rcpt-value"><?php echo date('m-d h:i A', strtotime($printed_vip['entry_time'])); ?></span></div>
+    <div class="rcpt-row"><span class="rcpt-label">Exit</span><span class="rcpt-value"><?php echo date('m-d h:i A', strtotime($printed_vip['exit_time'])); ?></span></div>
+    <div class="rcpt-row"><span class="rcpt-label">Duration</span><span class="rcpt-value"><?php echo (int)$printed_vip['duration_minutes']; ?> Mins</span></div>
+
+    <div class="rcpt-total-box">
+        <div class="rcpt-total-label">TOTAL PAID</div>
+        <div class="rcpt-total-amount">FREE</div>
+    </div>
+
+    <p class="rcpt-thanks">ස්තුතියි! &nbsp;Thank You!</p>
+    <p class="rcpt-thanks-sub">නැවත එන්න &nbsp;•&nbsp; Drive Safe &nbsp;•&nbsp; See You Again</p>
+</div>
+<?php endif; ?>
+
 <script>
-$(document).ready(function() {
-    const table = $('#ticketsTable').DataTable({
-        pageLength: 10,
-        lengthMenu: [[10, 25, 50, 100], [10, 25, 50, 100]],
-        responsive: true,
-        order: [],
-        dom: '<"dt-top"fl>rt<"dt-bottom"ip>',
-        language: {
-            search: '',
-            searchPlaceholder: 'Search ticket, vehicle number, type...',
-            lengthMenu: 'Show _MENU_ rows',
-            info: 'Showing <b>_START_–_END_</b> of <b>_TOTAL_</b> tickets',
-            infoEmpty: 'No tickets to show',
-            infoFiltered: '(filtered from _MAX_)',
-            zeroRecords: 'No matching tickets found',
-            paginate: {
-                previous: '<i class="fa-solid fa-chevron-left"></i>',
-                next: '<i class="fa-solid fa-chevron-right"></i>'
-            }
+    // Moves the printable receipt to be a direct child of <body> right before
+    // printing, so the print stylesheet can reliably hide everything else
+    // (page header/sidebar/etc.) without leftover blank pages.
+    function printReceipt() {
+        var receipt = document.getElementById('printableReceipt');
+        if (receipt) {
+            document.body.appendChild(receipt);
         }
-    });
+        window.print();
+    }
 
-    // Quick filter chips
-    $('#statusChips .chip').on('click', function () {
-        $('#statusChips .chip').removeClass('active');
-        $(this).addClass('active');
-        const f = $(this).data('filter');
-        table.column(4).search('');
-        table.column(5).search('');
-        if (f === 'VIP') table.column(4).search('VIP');
-        else if (f !== 'ALL') table.column(5).search(f);
-        table.draw();
-    });
+    function setMode(mode) {
+        const btnNormal = document.getElementById('btnNormalMode');
+        const btnLost = document.getElementById('btnLostMode');
+        const inputField = document.getElementById('search_input_field');
+        const qrBtn = document.getElementById('qrScanBtn');
+        const isLostMode = document.getElementById('is_lost_mode');
 
-    function updateLiveClock() {
+        if (mode === 'lost') {
+            btnNormal.className = 'mode-btn';
+            btnLost.className = 'mode-btn lost-active';
+            inputField.placeholder = "Enter Vehicle Plate No (e.g. CAB-1234)";
+            qrBtn.style.display = 'none';
+            isLostMode.value = '1';
+        } else {
+            btnNormal.className = 'mode-btn active';
+            btnLost.className = 'mode-btn';
+            inputField.placeholder = "Ticket Code OR Vehicle Number";
+            qrBtn.style.display = 'block';
+            isLostMode.value = '0';
+        }
+    }
+
+    let html5QrcodeScanner = null;
+    function toggleCameraScanner() {
+        const scannerBox = document.getElementById('qrScannerBox');
+        if (scannerBox.style.display === 'none' || scannerBox.style.display === '') {
+            scannerBox.style.display = 'block';
+            html5QrcodeScanner = new Html5Qrcode("reader");
+            html5QrcodeScanner.start({ facingMode: "environment" }, { fps: 10, qrbox: 250 }, onScanSuccess);
+        } else {
+            scannerBox.style.display = 'none';
+            if (html5QrcodeScanner) html5QrcodeScanner.stop();
+        }
+    }
+
+    function onScanSuccess(decodedText) {
+        if (html5QrcodeScanner) html5QrcodeScanner.stop();
+        document.getElementById('qr_ticket_code_input').value = decodedText;
+        document.getElementById('qrAutoForm').submit();
+    }
+
+    // Dynamic Clock
+    function updateClock() {
         const now = new Date();
-        document.getElementById('liveClock').textContent = now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
-        document.getElementById('liveDate').textContent = now.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
+        const year = now.getFullYear();
+        const month = String(now.getMonth() + 1).padStart(2, '0');
+        const day = String(now.getDate()).padStart(2, '0');
+        const hours = String(now.getHours()).padStart(2, '0');
+        const minutes = String(now.getMinutes()).padStart(2, '0');
+        const seconds = String(now.getSeconds()).padStart(2, '0');
+        
+        const clockElem = document.getElementById('liveClock');
+        if(clockElem) {
+            clockElem.textContent = `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
+        }
     }
-    updateLiveClock();
-    setInterval(updateLiveClock, 1000);
-});
 
-// Mobile / tablet sidebar drawer
-(function () {
-    const sidebar = document.getElementById('dashboardSidebar');
-    const overlay = document.getElementById('sidebarOverlay');
-    const toggle  = document.getElementById('sidebarToggle');
-    const closeBt = document.getElementById('sidebarClose');
-
-    function setOpen(open) {
-        sidebar.classList.toggle('open', open);
-        overlay.classList.toggle('show', open);
-        document.body.classList.toggle('nav-open', open);
-        toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
-    }
-    toggle.addEventListener('click', function () { setOpen(!sidebar.classList.contains('open')); });
-    closeBt.addEventListener('click', function () { setOpen(false); });
-    overlay.addEventListener('click', function () { setOpen(false); });
-    document.addEventListener('keydown', function (e) { if (e.key === 'Escape') setOpen(false); });
-    window.addEventListener('resize', function () { if (window.innerWidth > 992) setOpen(false); });
-})();
+    document.addEventListener("DOMContentLoaded", function() {
+        setInterval(updateClock, 1000);
+        updateClock();
+    });
 </script>
 
-</body>
-</html>
+<?php include 'includes/footer.php'; ?>
