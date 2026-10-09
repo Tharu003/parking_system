@@ -714,7 +714,7 @@ include 'includes/header.php';
         <div class="terminal-avatar"><i class="fa-solid fa-square-parking"></i></div>
         <div>
             <h2 style="font-size: 18px; font-weight: 700; margin: 0;">ParkSmart Terminal</h2>
-            <p style="font-size: 13px; color: rgba(255,255,255,0.75);">අම්බලන්ගොඩ විවිධ සේවා සමූපාකාර සමිතිය - Checkout & Gate Control</p>
+            <p style="font-size: 13px; color: rgba(255,255,255,0.75);"> Checkout & Gate Control</p>
         </div>
     </div>
     <div class="live-clock-badge">
@@ -908,7 +908,7 @@ include 'includes/header.php';
         <div class="vip-badge"><i class="fa-solid fa-crown"></i> VIP</div>
     <?php endif; ?>
     <h3 style="margin: 4px 0 2px 0; font-weight: 700;">PARK SMART</h3>
-    <p style="font-size: 11px; color: var(--text-muted); margin-bottom: 12px;">අම්බලන්ගොඩ විවිධ සේවා සමූපාකාර සමිතිය</p>
+    <p style="font-size: 11px; color: var(--text-muted); margin-bottom: 12px;"></p>
 
     <div class="ticket-info-grid">
         <div class="ticket-info-row"><span>Code:</span><strong style="color: var(--primary);"><?php echo htmlspecialchars($ticket_data['code']); ?></strong></div>
