@@ -619,7 +619,7 @@ function trace_icon($name) {
                 </div>
                 <div class="sidebar-brand-text">
                     <h2>PARK<span>SMART</span></h2>
-                    <p>Ambalangoda MPCS</p>
+                   
                 </div>
             </a>
 
@@ -663,7 +663,7 @@ function trace_icon($name) {
             <button type="button" class="mobile-menu-btn" id="sidebarToggle" aria-label="Open menu" aria-controls="dashboardSidebar" aria-expanded="false"><i class="fa-solid fa-bars"></i></button>
             <div class="mobile-brand">
                 <h2>PARK<span>SMART</span></h2>
-                <p>Ambalangoda MPCS</p>
+              
             </div>
         </div>
 
@@ -678,7 +678,7 @@ function trace_icon($name) {
             <div class="hero-copy">
                 <div class="restricted"><i class="fa-solid fa-lock"></i> CID &middot; Restricted Access</div>
                 <h1>Vehicle <span>Trace Console</span></h1>
-                <p>Ambalangoda MPCS security &amp; investigation portal &mdash; track any vehicle's history or see everything that was inside during a time window.</p>
+                <p> security &amp; investigation portal &mdash; track any vehicle's history or see everything that was inside during a time window.</p>
                 <div class="hero-stats">
                     <div class="hs"><b class="count" data-to="<?= (int)$count_parked ?>">0</b><small>Parked Now</small></div>
                     <div class="hs"><b class="count" data-to="<?= (int)$count_completed ?>">0</b><small>Exited</small></div>
@@ -809,7 +809,7 @@ function trace_icon($name) {
         <?php if ($total_entries > 0): ?>
         <section class="print-sheet">
             <div class="ps-band">
-                <div><h1>PARK<span>SMART</span> &middot; Ambalangoda MPCS Ltd</h1><p>CID Security Investigation Report</p></div>
+                <div><h1>PARK<span>SMART</span></h1><p>CID Security Investigation Report</p></div>
                 <div class="cid">Case No<b><?php echo $case_id; ?></b></div>
             </div>
             <div class="ps-meta">
