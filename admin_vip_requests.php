@@ -677,7 +677,7 @@ foreach ([['APPROVED', $count_approved, '#16A34A'], ['USED', $count_used, '#FF6B
                 </div>
                 <div class="sidebar-brand-text">
                     <h2>PARK<span>SMART</span></h2>
-                    <p>Ambalangoda MPCS</p>
+                  
                 </div>
             </a>
 
@@ -724,7 +724,7 @@ foreach ([['APPROVED', $count_approved, '#16A34A'], ['USED', $count_used, '#FF6B
             <button type="button" class="mobile-menu-btn" id="sidebarToggle" aria-label="Open menu" aria-controls="dashboardSidebar" aria-expanded="false"><i class="fa-solid fa-bars"></i></button>
             <div class="mobile-brand">
                 <h2>PARK<span>SMART</span></h2>
-                <p>Ambalangoda MPCS</p>
+              
             </div>
         </div>
 
@@ -735,7 +735,7 @@ foreach ([['APPROVED', $count_approved, '#16A34A'], ['USED', $count_used, '#FF6B
                 <div><div class="clock-time" id="liveClock">00:00:00 AM</div><div class="clock-date" id="liveDate">Loading...</div></div>
             </div>
             <div class="hero-copy">
-                <div class="eyebrow"><i class="fa-solid fa-crown"></i> Ambalangoda MPCS</div>
+                
                 <h1>VIP <span class="gold">Approvals</span></h1>
                 <p>Review special parking requests and grant golden passes with a single tap.</p>
                 <div class="legend">
