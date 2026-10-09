@@ -587,7 +587,7 @@ function staff_initials($name) {
                 </div>
                 <div class="sidebar-brand-text">
                     <h2>PARK<span>SMART</span></h2>
-                    <p>Ambalangoda MPCS</p>
+                    
                 </div>
             </a>
 
@@ -634,7 +634,7 @@ function staff_initials($name) {
             <button type="button" class="mobile-menu-btn" id="sidebarToggle" aria-label="Open menu" aria-controls="dashboardSidebar" aria-expanded="false"><i class="fa-solid fa-bars"></i></button>
             <div class="mobile-brand">
                 <h2>PARK<span>SMART</span></h2>
-                <p>Ambalangoda MPCS</p>
+              
             </div>
         </div>
 
@@ -649,7 +649,7 @@ function staff_initials($name) {
             </div>
             <div class="radar"><span></span><span></span><span></span><i class="fa-solid fa-shield-halved"></i></div>
             <div class="hero-text">
-                <div class="hero-eyebrow"><i class="fa-solid fa-user-shield"></i> Ambalangoda MPCS</div>
+              
                 <h1>Security <span>Team</span></h1>
                 <p>Manage terminal operator access &mdash; switch any officer on or off with a single tap.</p>
                 <div class="hero-stats">
