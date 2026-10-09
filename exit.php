@@ -576,7 +576,7 @@ include 'includes/header.php';
         <div class="exit-avatar"><i class="fa-solid fa-right-from-bracket"></i></div>
         <div>
             <h2 style="font-size: 20px; font-weight: 700;">ParkSmart Exit Gate Terminal</h2>
-            <p style="font-size: 13px; color: rgba(255,255,255,0.75);">අම්බලන්ගොඩ විවිධ සේවා සමූපාකාර සමිතිය - Checkout & Gate Control</p>
+            <p style="font-size: 13px; color: rgba(255,255,255,0.75);"> Checkout & Gate Control</p>
         </div>
     </div>
     <div class="live-clock-badge">
@@ -938,7 +938,7 @@ include 'includes/header.php';
 <?php if($printed_ticket): ?>
 <div class="receipt-print-area" id="printableReceipt">
     <p class="rcpt-brand">PARK SMART</p>
-    <p class="rcpt-sub">අම්බලන්ගොඩ විවිධ සේවා සමූපාකාර සමිතිය</p>
+    <p class="rcpt-sub"></p>
     <p class="rcpt-meta">Exit Receipt &nbsp;•&nbsp; <?php echo date('Y-m-d h:i A'); ?></p>
 
     <hr class="rcpt-divider">
@@ -968,7 +968,7 @@ include 'includes/header.php';
 <?php if($printed_vip): ?>
 <div class="receipt-print-area" id="printableReceipt">
     <p class="rcpt-brand">PARK SMART</p>
-    <p class="rcpt-sub">අම්බලන්ගොඩ විවිධ සේවා සමූපාකාර සමිතිය</p>
+    <p class="rcpt-sub"></p>
     <p class="rcpt-meta">VIP Exit Receipt &nbsp;•&nbsp; <?php echo date('Y-m-d h:i A'); ?></p>
 
     <hr class="rcpt-divider">
