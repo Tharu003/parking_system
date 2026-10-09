@@ -363,7 +363,7 @@ if (isset($_POST['admin_login'])) {
         </div>
 
         <div class="brand-footer-note">
-            &copy; <?php echo date('Y'); ?> අම්බලන්ගොඩ විවිධ සේවා සමූපාකාර සමිතිය &middot; ParkSmart Control Panel
+            &copy; <?php echo date('Y'); ?>  &middot; ParkSmart Control Panel
         </div>
     </div>
 
