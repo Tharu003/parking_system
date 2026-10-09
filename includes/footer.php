@@ -144,12 +144,12 @@
 <footer class="main-footer">
     <div class="footer-top">
         <div class="footer-box">
-            <h3>ParkSmart System</h3>
-            <p>ස්වයංක්‍රීය කාල මත පදනම් වූ වාහන නැවැත්වීමේ පාලන පද්ධතිය. ටිකට්පත් නිකුත් කිරීම සහ QR Scanning තාක්ෂණයෙන් සමන්විත වේ.</p>
+            <h3>Smart Service Management System</h3>
+            <p>නවීන ඩිජිටල් සේවා, කළමනාකරණ සහ පාලන කාර්යයන් සඳහා නිර්මාණය කළ සරල හා කාර්යක්ෂම පද්ධතියකි.</p>
             <div class="coop-badge">
                 <h4><i class="fa-solid fa-building-flag"></i> හිමිකාරිත්වය</h4>
                 <p style="font-size: 12px; margin-bottom: 0; color: rgba(255,255,255,0.85);">
-                    මෙය <strong>අම්බලන්ගොඩ විවිධ සේවා සමූපාකාර සමිතියට</strong> අයත් නිල Parking පහසුකමකි.
+                    මෙම පද්ධතිය ආයතනයේ දෛනික සේවා හා කළමනාකරණ කටයුතු පහසු කිරීම සඳහා නිර්මාණය කර ඇත.
                 </p>
             </div>
         </div>
@@ -157,23 +157,23 @@
         <div class="footer-box">
             <h3>Quick Links</h3>
             <ul class="footer-links">
-                <li><a href="index.php"><i class="fa-solid fa-chevron-right"></i> Entry Gate Terminal</a></li>
-                <li><a href="exit.php"><i class="fa-solid fa-chevron-right"></i> Exit QR Verification</a></li>
-                <li><a href="vip_request.php"><i class="fa-solid fa-chevron-right"></i> VIP Pass Application</a></li>
-                <li><a href="admin_login.php"><i class="fa-solid fa-chevron-right"></i> Security Admin Panel</a></li>
+                <li><a href="index.php"><i class="fa-solid fa-chevron-right"></i> Dashboard</a></li>
+                <li><a href="exit.php"><i class="fa-solid fa-chevron-right"></i> Service Management</a></li>
+                <li><a href="vip_request.php"><i class="fa-solid fa-chevron-right"></i> Requests</a></li>
+                <li><a href="admin_login.php"><i class="fa-solid fa-chevron-right"></i> Admin Panel</a></li>
             </ul>
         </div>
 
         <div class="footer-box">
             <h3>Contact & Location</h3>
-            <p><i class="fa-solid fa-location-dot" style="color: #FF6B00;"></i> ප්‍රධාන බස් නැවතුම්පොළ අසල, අම්බලන්ගොඩ.</p>
-            <p><i class="fa-solid fa-phone" style="color: #FF6B00;"></i> +94 91 225 8000</p>
-            <p><i class="fa-solid fa-envelope" style="color: #FF6B00;"></i> info@ambalangodacoop.lk</p>
+            <p><i class="fa-solid fa-location-dot" style="color: #FF6B00;"></i>ගාල්ල‍ , ශ්‍රී ලංකාව </p>
+            <p><i class="fa-solid fa-phone" style="color: #FF6B00;"></i> +94 91 000 0000</p>
+            <p><i class="fa-solid fa-envelope" style="color: #FF6B00;"></i> info@example.com</p>
         </div>
     </div>
 
     <div class="footer-bottom">
-        <p>&copy; <?php echo date('Y'); ?> අම්බලන්ගොඩ විවිධ සේවා සමූපාකාර සමිතිය. All Rights Reserved. Powered by ParkSmart.</p>
+        <p>&copy; <?php echo date('Y'); ?> Smart Service Management System. All Rights Reserved.</p>
     </div>
 </footer>
 
@@ -181,19 +181,19 @@
 <div class="mobile-bottom-nav">
     <div class="mobile-nav-container">
         <a href="index.php" class="mobile-nav-item active">
-            <i class="fa-solid fa-ticket"></i>
-            Entry
+            <i class="fa-solid fa-gauge-high"></i>
+            Home
         </a>
         <a href="exit.php" class="mobile-nav-item">
-            <i class="fa-solid fa-right-from-bracket"></i>
-            Exit
+            <i class="fa-solid fa-briefcase"></i>
+            Services
         </a>
         <a href="vip_request.php" class="mobile-nav-item">
-            <i class="fa-solid fa-crown"></i>
-            VIP
+            <i class="fa-solid fa-list-check"></i>
+            Requests
         </a>
         <a href="admin_login.php" class="mobile-nav-item">
-            <i class="fa-solid fa-user-shield"></i>
+            <i class="fa-solid fa-user-gear"></i>
             Admin
         </a>
     </div>
