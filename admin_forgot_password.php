@@ -349,7 +349,7 @@ if (isset($_POST['reset_password']) && $step === 2 && isset($_SESSION['reset_adm
         </div>
 
         <div class="brand-footer-note">
-            &copy; <?php echo date('Y'); ?> අම්බලන්ගොඩ විවිධ සේවා සමූපාකාර සමිතිය &middot; ParkSmart Control Panel
+            &copy; <?php echo date('Y'); ?>  &middot; ParkSmart Control Panel
         </div>
     </div>
 
